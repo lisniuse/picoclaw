@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/chzyer/readline"
 
@@ -48,8 +49,23 @@ func agentCmd(message, sessionKey, model string, debug bool) error {
 	}
 
 	msgBus := bus.NewMessageBus()
-	defer msgBus.Close()
+	// defer msgBus.Close()
 	agentLoop := agent.NewAgentLoop(cfg, msgBus, provider)
+
+	// Subscribe to outbound messages to show async responses (like complex task results)
+	go func() {
+		ctx := context.Background()
+		for {
+			msg, ok := msgBus.SubscribeOutbound(ctx)
+			if !ok {
+				return
+			}
+			// Only print if not empty (ProcessDirect might return empty if handled async)
+			if msg.Content != "" {
+				fmt.Printf("\n%s [Async] %s\n\n", internal.Logo, msg.Content)
+			}
+		}
+	}()
 
 	// Print agent startup info (only for interactive mode)
 	startupInfo := agentLoop.GetStartupInfo()
@@ -66,7 +82,24 @@ func agentCmd(message, sessionKey, model string, debug bool) error {
 		if err != nil {
 			return fmt.Errorf("error processing message: %w", err)
 		}
-		fmt.Printf("\n%s %s\n", internal.Logo, response)
+		if response != "" {
+			fmt.Printf("\n%s %s\n", internal.Logo, response)
+		}
+		
+		// If response is empty, it might be an async task. Wait a bit for async messages.
+		// For CLI one-shot command, we should wait until the async task is done or timeout.
+		// However, since we don't have a way to know when async task is done from here easily without refactoring,
+		// we can add a small sleep to allow initial async message (comfort message) to arrive if any.
+		// For long running tasks, the CLI command will exit. 
+		// TODO: Improve CLI one-shot to wait for async completion if needed.
+		if response == "" {
+			// Check if we are in complex task mode
+			if cfg.Features.ComplexTaskCheck {
+				// Wait for potential async messages
+				// Simple heuristic: wait for up to 5 seconds for a comfort message
+				time.Sleep(5 * time.Second)
+			}
+		}
 		return nil
 	}
 

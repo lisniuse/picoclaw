@@ -9,8 +9,10 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -348,6 +350,99 @@ func (al *AgentLoop) ProcessHeartbeat(ctx context.Context, content, channel, cha
 	})
 }
 
+type complexTaskResult struct {
+	XMLName        xml.Name `xml:"result"`
+	IsComplex      bool     `xml:"is_complex"`
+	ComfortMessage string   `xml:"comfort_message"`
+}
+
+func (al *AgentLoop) readAgentFile(agent *AgentInstance, relPath string) string {
+	path := filepath.Join(agent.Workspace, relPath)
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return string(content)
+}
+
+func (al *AgentLoop) checkComplexTask(ctx context.Context, agent *AgentInstance, userMessage string) (*complexTaskResult, error) {
+	logger.InfoCF("agent", "Checking if task is complex...", map[string]any{"message_len": len(userMessage)})
+	// Use default model if not configured
+	model := al.cfg.Features.ComplexTaskModel
+	if model == "" {
+		model = agent.Model
+	}
+
+	// Load context files
+	soul := al.readAgentFile(agent, "SOUL.md")
+	userInfo := al.readAgentFile(agent, "USER.md")
+	memory := al.readAgentFile(agent, "memory/MEMORY.md")
+
+	contextStr := ""
+	if soul != "" {
+		contextStr += fmt.Sprintf("\n<soul_persona>\n%s\n</soul_persona>", soul)
+	}
+	if userInfo != "" {
+		contextStr += fmt.Sprintf("\n<user_info>\n%s\n</user_info>", userInfo)
+	}
+	if memory != "" {
+		contextStr += fmt.Sprintf("\n<memory>\n%s\n</memory>", memory)
+	}
+
+	// Construct prompt
+	prompt := fmt.Sprintf(`Analyze the user's request: "%s"
+
+%s
+
+Is this a complex task that might take a long time to complete (e.g. writing a full application, detailed research)?
+Reply ONLY in XML format:
+<result>
+  <is_complex>true</is_complex> <!-- or false -->
+  <comfort_message>A polite message to the user explaining that the task is complex and might take some time, but they can continue chatting with the main agent. Do not hardcode this message, generate it based on the context. If SOUL/PERSONA is provided, match the tone and style. If USER INFO is provided, address the user appropriately.</comfort_message>
+</result>`, userMessage, contextStr)
+
+	// Call LLM
+	msgs := []providers.Message{{Role: "user", Content: prompt}}
+	opts := map[string]any{
+		"temperature": 0.1, // Low temp for consistent XML
+	}
+
+	// Pass API Base/Key if provided in config overrides
+	if al.cfg.Features.ComplexTaskAPIBase != "" {
+		opts["api_base"] = al.cfg.Features.ComplexTaskAPIBase
+	}
+	if al.cfg.Features.ComplexTaskAPIKey != "" {
+		opts["api_key"] = al.cfg.Features.ComplexTaskAPIKey
+	}
+
+	resp, err := agent.Provider.Chat(ctx, msgs, nil, model, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	// Clean up response (remove markdown code blocks if any)
+	content := resp.Content
+	// Extract XML content
+	// Use LastIndex for start to avoid matching <result> inside <think> blocks or reasoning
+	start := strings.LastIndex(content, "<result>")
+	end := strings.LastIndex(content, "</result>")
+	if start != -1 && end != -1 && end > start {
+		content = content[start : end+len("</result>")]
+	} else {
+		content = strings.TrimPrefix(content, "```xml")
+		content = strings.TrimPrefix(content, "```")
+		content = strings.TrimSuffix(content, "```")
+		content = strings.TrimSpace(content)
+	}
+
+	var result complexTaskResult
+	if err := xml.Unmarshal([]byte(content), &result); err != nil {
+		return nil, fmt.Errorf("failed to parse XML: %w (content: %s)", err, content)
+	}
+
+	return &result, nil
+}
+
 func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage) (string, error) {
 	// Add message preview to log (show full content for error messages)
 	var logContent string
@@ -411,6 +506,81 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 			"session_key": sessionKey,
 			"matched_by":  route.MatchedBy,
 		})
+
+	if al.cfg.Features.ComplexTaskCheck {
+		logger.InfoCF("agent", "Complex task check enabled, analyzing request...", map[string]any{"msg_len": len(msg.Content)})
+		checkCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		res, err := al.checkComplexTask(checkCtx, agent, msg.Content)
+		cancel()
+
+		if err != nil {
+			logger.WarnCF("agent", "Complex task check failed", map[string]any{"error": err.Error()})
+		} else if res != nil && res.IsComplex {
+			logger.InfoCF("agent", "Identified as complex task", map[string]any{"comfort_msg": res.ComfortMessage != ""})
+			// Send comfort message
+			if res.ComfortMessage != "" {
+				// Use a separate goroutine to send comfort message to ensure it doesn't block
+				// and is sent "immediately" from the user's perspective while we start processing
+				go func(comfortMsg string, ch string, cid string) {
+					pubCtx, pubCancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer pubCancel()
+					
+					logger.InfoCF("agent", "Sending comfort message (async)", map[string]any{"content_preview": utils.Truncate(comfortMsg, 20)})
+					if err := al.bus.PublishOutbound(pubCtx, bus.OutboundMessage{
+						Channel: ch,
+						ChatID:  cid,
+						Content: comfortMsg,
+					}); err != nil {
+						logger.WarnCF("agent", "Failed to send comfort message", map[string]any{"error": err.Error()})
+					} else {
+						logger.InfoCF("agent", "Comfort message sent to bus", nil)
+					}
+				}(res.ComfortMessage, msg.Channel, msg.ChatID)
+			}
+
+			// Process in background
+			go func() {
+				// Sleep briefly to ensure comfort message is processed/sent first by the channel worker
+				// This is a heuristic to avoid race conditions where the result might be computed very fast (unlikely for complex tasks but possible)
+				// or to simply give the user a moment to see the comfort message.
+				time.Sleep(200 * time.Millisecond)
+				
+				logger.InfoCF("agent", "Starting background task processing", nil)
+				// Use a fresh context for the background task
+				bgCtx := context.Background()
+				resp, err := al.runAgentLoop(bgCtx, agent, processOptions{
+					SessionKey:      sessionKey,
+					Channel:         msg.Channel,
+					ChatID:          msg.ChatID,
+					UserMessage:     msg.Content,
+					DefaultResponse: defaultResponse,
+					EnableSummary:   true,
+					SendResponse:    true,
+				})
+
+				if err != nil {
+					logger.ErrorCF("agent", "Background task failed", map[string]any{"error": err.Error()})
+					// Try to notify user of failure with timeout
+					pubCtx, pubCancel := context.WithTimeout(bgCtx, 5*time.Second)
+					defer pubCancel()
+					al.bus.PublishOutbound(pubCtx, bus.OutboundMessage{
+						Channel: msg.Channel,
+						ChatID:  msg.ChatID,
+						Content: fmt.Sprintf("Task processing failed: %v", err),
+					})
+					return
+				}
+				
+				// runAgentLoop already sends response if SendResponse is true, so no need to duplicate publish
+				// Just log completion
+				logger.InfoCF("agent", "Background task completed", map[string]any{"resp_len": len(resp)})
+			}()
+
+			return "", nil
+		} else {
+			logger.InfoCF("agent", "Identified as simple task", nil)
+		}
+	}
 
 	return al.runAgentLoop(ctx, agent, processOptions{
 		SessionKey:      sessionKey,

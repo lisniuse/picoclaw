@@ -58,6 +58,14 @@ type Config struct {
 	Tools     ToolsConfig     `json:"tools"`
 	Heartbeat HeartbeatConfig `json:"heartbeat"`
 	Devices   DevicesConfig   `json:"devices"`
+	Features  FeaturesConfig  `json:"features"`
+}
+
+type FeaturesConfig struct {
+	ComplexTaskCheck   bool   `json:"complex_task_check"`
+	ComplexTaskModel   string `json:"complex_task_model"`
+	ComplexTaskAPIBase string `json:"complex_task_api_base"`
+	ComplexTaskAPIKey  string `json:"complex_task_api_key"`
 }
 
 // MarshalJSON implements custom JSON marshaling for Config
