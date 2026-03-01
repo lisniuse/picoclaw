@@ -30,8 +30,9 @@ type AgentInstance struct {
 	ContextBuilder *ContextBuilder
 	Tools          *tools.ToolRegistry
 	Subagents      *config.SubagentsConfig
-	SkillsFilter   []string
-	Candidates     []providers.FallbackCandidate
+	SkillsFilter           []string
+	Candidates             []providers.FallbackCandidate
+	EnableLongTaskDetector bool
 }
 
 // NewAgentInstance creates an agent instance from config.
@@ -70,12 +71,16 @@ func NewAgentInstance(
 	agentName := ""
 	var subagents *config.SubagentsConfig
 	var skillsFilter []string
+	enableDetector := defaults.EnableLongTaskDetector
 
 	if agentCfg != nil {
 		agentID = routing.NormalizeAgentID(agentCfg.ID)
 		agentName = agentCfg.Name
 		subagents = agentCfg.Subagents
 		skillsFilter = agentCfg.Skills
+		if agentCfg.EnableLongTaskDetector != nil {
+			enableDetector = *agentCfg.EnableLongTaskDetector
+		}
 	}
 
 	maxIter := defaults.MaxToolIterations
@@ -155,8 +160,9 @@ func NewAgentInstance(
 		ContextBuilder: contextBuilder,
 		Tools:          toolsRegistry,
 		Subagents:      subagents,
-		SkillsFilter:   skillsFilter,
-		Candidates:     candidates,
+		SkillsFilter:           skillsFilter,
+		Candidates:             candidates,
+		EnableLongTaskDetector: enableDetector,
 	}
 }
 

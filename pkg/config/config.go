@@ -135,8 +135,9 @@ type AgentConfig struct {
 	Name      string            `json:"name,omitempty"`
 	Workspace string            `json:"workspace,omitempty"`
 	Model     *AgentModelConfig `json:"model,omitempty"`
-	Skills    []string          `json:"skills,omitempty"`
-	Subagents *SubagentsConfig  `json:"subagents,omitempty"`
+	Skills                 []string          `json:"skills,omitempty"`
+	Subagents              *SubagentsConfig  `json:"subagents,omitempty"`
+	EnableLongTaskDetector *bool             `json:"enable_long_task_detector,omitempty"`
 }
 
 type SubagentsConfig struct {
@@ -177,8 +178,9 @@ type AgentDefaults struct {
 	ImageModel          string   `json:"image_model,omitempty"           env:"PICOCLAW_AGENTS_DEFAULTS_IMAGE_MODEL"`
 	ImageModelFallbacks []string `json:"image_model_fallbacks,omitempty"`
 	MaxTokens           int      `json:"max_tokens"                      env:"PICOCLAW_AGENTS_DEFAULTS_MAX_TOKENS"`
-	Temperature         *float64 `json:"temperature,omitempty"           env:"PICOCLAW_AGENTS_DEFAULTS_TEMPERATURE"`
-	MaxToolIterations   int      `json:"max_tool_iterations"             env:"PICOCLAW_AGENTS_DEFAULTS_MAX_TOOL_ITERATIONS"`
+	Temperature            *float64 `json:"temperature,omitempty"           env:"PICOCLAW_AGENTS_DEFAULTS_TEMPERATURE"`
+	MaxToolIterations      int      `json:"max_tool_iterations"             env:"PICOCLAW_AGENTS_DEFAULTS_MAX_TOOL_ITERATIONS"`
+	EnableLongTaskDetector bool     `json:"enable_long_task_detector"       env:"PICOCLAW_AGENTS_DEFAULTS_ENABLE_LONG_TASK_DETECTOR"`
 }
 
 // GetModelName returns the effective model name for the agent defaults.

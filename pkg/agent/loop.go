@@ -412,6 +412,59 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 			"matched_by":  route.MatchedBy,
 		})
 
+	if agent.EnableLongTaskDetector {
+		isLong, reply, err := al.detectLongTask(ctx, agent, msg.Content)
+		if err == nil && isLong {
+			logger.InfoCF("agent", "Long task detected, switching to background processing",
+				map[string]any{
+					"agent_id":    agent.ID,
+					"session_key": sessionKey,
+				})
+
+			// 1. Send reassurance immediately
+			if reply != "" {
+				al.bus.PublishOutbound(ctx, bus.OutboundMessage{
+					Channel: msg.Channel,
+					ChatID:  msg.ChatID,
+					Content: reply,
+				})
+			}
+
+			// 2. Run in background
+			go func() {
+				// Create a background context that is not tied to the original request timeout
+				bgCtx := context.Background()
+
+				res, err := al.runAgentLoop(bgCtx, agent, processOptions{
+					SessionKey:      sessionKey,
+					Channel:         msg.Channel,
+					ChatID:          msg.ChatID,
+					UserMessage:     msg.Content,
+					DefaultResponse: defaultResponse,
+					EnableSummary:   true,
+					SendResponse:    false, // We handle sending manually
+				})
+
+				if err != nil {
+					logger.ErrorCF("agent", "Background task failed", map[string]any{"error": err.Error()})
+					return
+				}
+
+				// 3. Send result when done
+				if res != "" {
+					al.bus.PublishOutbound(bgCtx, bus.OutboundMessage{
+						Channel: msg.Channel,
+						ChatID:  msg.ChatID,
+						Content: res,
+					})
+				}
+			}()
+
+			// Return empty so the main loop doesn't send anything further for this request
+			return "", nil
+		}
+	}
+
 	return al.runAgentLoop(ctx, agent, processOptions{
 		SessionKey:      sessionKey,
 		Channel:         msg.Channel,
@@ -1349,4 +1402,57 @@ func extractParentPeer(msg bus.InboundMessage) *routing.RoutePeer {
 		return nil
 	}
 	return &routing.RoutePeer{Kind: parentKind, ID: parentID}
+}
+
+type longTaskResponse struct {
+	IsLongTask bool   `json:"is_long_task"`
+	Reply      string `json:"reply"`
+}
+
+func (al *AgentLoop) detectLongTask(ctx context.Context, agent *AgentInstance, input string) (bool, string, error) {
+	prompt := fmt.Sprintf(`Analyze the following user request. Is it a complex task that will take a long time to process (e.g. > 15 seconds processing, multiple steps, complex coding, extensive web search)?
+Return ONLY JSON: {"is_long_task": bool, "reply": "string"}
+"reply" should be a short, polite message (in the same language as user input) informing the user that the task is complex and will be processed in the background, but they can continue chatting with the main assistant while waiting.
+Do not include markdown formatting like backticks.
+
+User input: "%s"`, input)
+
+	messages := []providers.Message{
+		{Role: "user", Content: prompt},
+	}
+
+	// Use a fresh context for detection with short timeout
+	detectCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	opts := map[string]any{
+		"temperature": 0.1,
+		"max_tokens":  200,
+	}
+
+	resp, err := agent.Provider.Chat(detectCtx, messages, nil, agent.Model, opts)
+	if err != nil {
+		return false, "", err
+	}
+
+	content := resp.Content
+	content = strings.TrimPrefix(content, "```json")
+	content = strings.TrimPrefix(content, "```")
+	content = strings.TrimSuffix(content, "```")
+	content = strings.TrimSpace(content)
+
+	var result longTaskResponse
+	if err := json.Unmarshal([]byte(content), &result); err != nil {
+		start := strings.Index(content, "{")
+		end := strings.LastIndex(content, "}")
+		if start >= 0 && end > start {
+			if err := json.Unmarshal([]byte(content[start:end+1]), &result); err != nil {
+				return false, "", err
+			}
+		} else {
+			return false, "", err
+		}
+	}
+
+	return result.IsLongTask, result.Reply, nil
 }
