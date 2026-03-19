@@ -643,7 +643,8 @@ type ModelConfig struct {
 	RPM            int    `json:"rpm,omitempty"`              // Requests per minute limit
 	MaxTokensField string `json:"max_tokens_field,omitempty"` // Field name for max tokens (e.g., "max_completion_tokens")
 	RequestTimeout int    `json:"request_timeout,omitempty"`
-	ThinkingLevel  string `json:"thinking_level,omitempty"` // Extended thinking: off|low|medium|high|xhigh|adaptive
+	ThinkingLevel      string `json:"thinking_level,omitempty"`       // Extended thinking: off|low|medium|high|xhigh|adaptive
+	StripThinkingTags  bool   `json:"strip_thinking_tags,omitempty"`  // Strip <think>...</think> from final reply
 }
 
 // Validate checks if the ModelConfig has all required fields.

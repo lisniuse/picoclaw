@@ -1,6 +1,19 @@
 package agent
 
-import "strings"
+import (
+	"regexp"
+	"strings"
+)
+
+// thinkTagRe matches <think>...</think> blocks, including multiline content.
+var thinkTagRe = regexp.MustCompile(`(?is)<think>.*?</think>`)
+
+// stripThinkingTags removes all <think>...</think> blocks from s and trims
+// any leading/trailing whitespace that results from the removal.
+func stripThinkingTags(s string) string {
+	result := thinkTagRe.ReplaceAllString(s, "")
+	return strings.TrimSpace(result)
+}
 
 // ThinkingLevel controls how the provider sends thinking parameters.
 //

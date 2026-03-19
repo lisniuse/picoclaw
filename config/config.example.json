@@ -49,7 +49,8 @@
     {
       "model_name": "longcat",
       "model": "longcat/LongCat-Flash-Thinking",
-      "api_key": "your-longcat-api-key"
+      "api_key": "your-longcat-api-key",
+      "strip_thinking_tags": true
     },
     {
       "model_name": "modelscope-qwen",

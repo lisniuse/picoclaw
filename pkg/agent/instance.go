@@ -30,6 +30,7 @@ type AgentInstance struct {
 	MaxTokens                 int
 	Temperature               float64
 	ThinkingLevel             ThinkingLevel
+	StripThinkingTags         bool
 	ContextWindow             int
 	SummarizeMessageThreshold int
 	SummarizeTokenPercent     int
@@ -136,8 +137,10 @@ func NewAgentInstance(
 	}
 
 	var thinkingLevelStr string
+	var stripThinkingTags bool
 	if mc, err := cfg.GetModelConfig(model); err == nil {
 		thinkingLevelStr = mc.ThinkingLevel
+		stripThinkingTags = mc.StripThinkingTags
 	}
 	thinkingLevel := parseThinkingLevel(thinkingLevelStr)
 
@@ -182,6 +185,7 @@ func NewAgentInstance(
 		MaxTokens:                 maxTokens,
 		Temperature:               temperature,
 		ThinkingLevel:             thinkingLevel,
+		StripThinkingTags:         stripThinkingTags,
 		ContextWindow:             maxTokens,
 		SummarizeMessageThreshold: summarizeMessageThreshold,
 		SummarizeTokenPercent:     summarizeTokenPercent,

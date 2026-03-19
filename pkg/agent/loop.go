@@ -1237,6 +1237,9 @@ func (al *AgentLoop) runLLMIteration(
 			if finalContent == "" && response.ReasoningContent != "" {
 				finalContent = response.ReasoningContent
 			}
+			if agent.StripThinkingTags {
+				finalContent = stripThinkingTags(finalContent)
+			}
 			logger.InfoCF("agent", "LLM response without tool calls (direct answer)",
 				map[string]any{
 					"agent_id":      agent.ID,
@@ -1986,6 +1989,7 @@ func (al *AgentLoop) buildCommandsRuntime(agent *AgentInstance, opts *processOpt
 			agent.Provider = nextProvider
 			agent.Candidates = nextCandidates
 			agent.ThinkingLevel = parseThinkingLevel(modelCfg.ThinkingLevel)
+			agent.StripThinkingTags = modelCfg.StripThinkingTags
 
 			if oldProvider != nil && oldProvider != nextProvider {
 				if stateful, ok := oldProvider.(providers.StatefulProvider); ok {
