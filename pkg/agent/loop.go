@@ -70,7 +70,8 @@ type processOptions struct {
 }
 
 const (
-	defaultResponse           = "I've completed processing but have no response to give. Increase `max_tool_iterations` in config.json."
+	defaultResponse           = "The model returned an empty response. This may indicate a provider error or token limit."
+	toolLimitResponse         = "I've reached `max_tool_iterations` without a final response. Increase `max_tool_iterations` in config.json if this task needs more tool steps."
 	sessionKeyAgentPrefix     = "agent:"
 	metadataKeyAccountID      = "account_id"
 	metadataKeyGuildID        = "guild_id"
@@ -278,58 +279,64 @@ func (al *AgentLoop) Run(ctx context.Context) error {
 				return nil
 			}
 			// Process message
-			// TODO: Re-enable media cleanup after inbound media is properly consumed by the agent.
-			// Currently disabled because files are deleted before the LLM can access their content.
-			// defer func() {
-			// 	if al.mediaStore != nil && msg.MediaScope != "" {
-			// 		if releaseErr := al.mediaStore.ReleaseAll(msg.MediaScope); releaseErr != nil {
-			// 			logger.WarnCF("agent", "Failed to release media", map[string]any{
-			// 				"scope": msg.MediaScope,
-			// 				"error": releaseErr.Error(),
-			// 			})
-			// 		}
-			// 	}
-			// }()
+			func() {
+				defer func() {
+					if al.channelManager != nil {
+						al.channelManager.InvokeTypingStop(msg.Channel, msg.ChatID)
+					}
+				}()
+				// TODO: Re-enable media cleanup after inbound media is properly consumed by the agent.
+				// Currently disabled because files are deleted before the LLM can access their content.
+				// defer func() {
+				// 	if al.mediaStore != nil && msg.MediaScope != "" {
+				// 		if releaseErr := al.mediaStore.ReleaseAll(msg.MediaScope); releaseErr != nil {
+				// 			logger.WarnCF("agent", "Failed to release media", map[string]any{
+				// 				"scope": msg.MediaScope,
+				// 				"error": releaseErr.Error(),
+				// 			})
+				// 		}
+				// 	}
+				// }()
 
-			response, err := al.processMessage(ctx, msg)
-			if err != nil {
-				response = fmt.Sprintf("Error processing message: %v", err)
-			}
+				response, err := al.processMessage(ctx, msg)
+				if err != nil {
+					response = fmt.Sprintf("Error processing message: %v", err)
+				}
 
-			if response != "" {
-				// Check if the message tool already sent a response during this round.
-				// If so, skip publishing to avoid duplicate messages to the user.
-				// Use default agent's tools to check (message tool is shared).
-				alreadySent := false
-				defaultAgent := al.GetRegistry().GetDefaultAgent()
-				if defaultAgent != nil {
-					if tool, ok := defaultAgent.Tools.Get("message"); ok {
-						if mt, ok := tool.(*tools.MessageTool); ok {
-							alreadySent = mt.HasSentInRound()
+				if response != "" {
+					// Check if the message tool already sent a response during this round.
+					// If so, skip publishing to avoid duplicate messages to the user.
+					// Use default agent's tools to check (message tool is shared).
+					alreadySent := false
+					defaultAgent := al.GetRegistry().GetDefaultAgent()
+					if defaultAgent != nil {
+						if tool, ok := defaultAgent.Tools.Get("message"); ok {
+							if mt, ok := tool.(*tools.MessageTool); ok {
+								alreadySent = mt.HasSentInRound()
+							}
 						}
 					}
-				}
-
-				if !alreadySent {
-					al.bus.PublishOutbound(ctx, bus.OutboundMessage{
-						Channel: msg.Channel,
-						ChatID:  msg.ChatID,
-						Content: response,
-					})
-					logger.InfoCF("agent", "Published outbound response",
-						map[string]any{
-							"channel":     msg.Channel,
-							"chat_id":     msg.ChatID,
-							"content_len": len(response),
+					if !alreadySent {
+						al.bus.PublishOutbound(ctx, bus.OutboundMessage{
+							Channel: msg.Channel,
+							ChatID:  msg.ChatID,
+							Content: response,
 						})
-				} else {
-					logger.DebugCF(
-						"agent",
-						"Skipped outbound (message tool already sent)",
-						map[string]any{"channel": msg.Channel},
-					)
+						logger.InfoCF("agent", "Published outbound response",
+							map[string]any{
+								"channel":     msg.Channel,
+								"chat_id":     msg.ChatID,
+								"content_len": len(response),
+							})
+					} else {
+						logger.DebugCF(
+							"agent",
+							"Skipped outbound (message tool already sent)",
+							map[string]any{"channel": msg.Channel},
+						)
+					}
 				}
-			}
+			}()
 		default:
 			time.Sleep(time.Microsecond * 200)
 		}
@@ -929,7 +936,11 @@ func (al *AgentLoop) runAgentLoop(
 
 	// 4. Handle empty response
 	if finalContent == "" {
-		finalContent = opts.DefaultResponse
+		if iteration >= agent.MaxIterations && agent.MaxIterations > 0 {
+			finalContent = toolLimitResponse
+		} else {
+			finalContent = opts.DefaultResponse
+		}
 	}
 
 	// 5. Save final assistant message to session
@@ -1020,6 +1031,7 @@ func (al *AgentLoop) handleReasoning(
 }
 
 // runLLMIteration executes the LLM call loop with tool handling.
+// Returns (finalContent, iteration, error).
 func (al *AgentLoop) runLLMIteration(
 	ctx context.Context,
 	agent *AgentInstance,
@@ -1028,6 +1040,13 @@ func (al *AgentLoop) runLLMIteration(
 ) (string, int, error) {
 	iteration := 0
 	var finalContent string
+
+	// Check if both the provider and channel support streaming
+	streamProvider, providerCanStream := agent.Provider.(providers.StreamingProvider)
+	var streamer bus.Streamer
+	if providerCanStream && !opts.NoHistory && !constants.IsInternalChannel(opts.Channel) {
+		streamer, _ = al.bus.GetStreamer(ctx, opts.Channel, opts.ChatID)
+	}
 
 	// Determine effective model tier for this conversation turn.
 	// selectCandidates evaluates routing once and the decision is sticky for
@@ -1109,6 +1128,16 @@ func (al *AgentLoop) runLLMIteration(
 		callLLM := func() (*providers.LLMResponse, error) {
 			al.activeRequests.Add(1)
 			defer al.activeRequests.Done()
+
+			// Use streaming when available (streamer obtained, provider supports it)
+			if streamer != nil && streamProvider != nil {
+				return streamProvider.ChatStream(
+					ctx, messages, providerToolDefs, activeModel, llmOpts,
+					func(accumulated string) {
+						streamer.Update(ctx, accumulated)
+					},
+				)
+			}
 
 			if len(activeCandidates) > 1 && al.fallback != nil {
 				fbResult, fbErr := al.fallback.Execute(
@@ -1240,13 +1269,30 @@ func (al *AgentLoop) runLLMIteration(
 			if agent.StripThinkingTags {
 				finalContent = stripThinkingTags(finalContent)
 			}
+
+			// If we were streaming, finalize the message (sends the permanent message)
+			if streamer != nil {
+				if err := streamer.Finalize(ctx, finalContent); err != nil {
+					logger.WarnCF("agent", "Stream finalize failed", map[string]any{
+						"error": err.Error(),
+					})
+				}
+			}
+
+
 			logger.InfoCF("agent", "LLM response without tool calls (direct answer)",
 				map[string]any{
 					"agent_id":      agent.ID,
 					"iteration":     iteration,
 					"content_chars": len(finalContent),
+					"streamed":      streamer != nil,
 				})
 			break
+		}
+
+		// Tool calls detected — cancel any active stream (draft auto-expires)
+		if streamer != nil {
+			streamer.Cancel(ctx)
 		}
 
 		normalizedToolCalls := make([]providers.ToolCall, 0, len(response.ToolCalls))

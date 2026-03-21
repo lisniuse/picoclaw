@@ -89,6 +89,7 @@ type Manager struct {
 	placeholders  sync.Map          // "channel:chatID" → placeholderID (string)
 	typingStops   sync.Map          // "channel:chatID" → func()
 	reactionUndos sync.Map          // "channel:chatID" → reactionEntry
+	streamActive  sync.Map          // "channel:chatID" → true (set when streamer.Finalize sent the message)
 	channelHashes map[string]string // channel name → config hash
 }
 
@@ -136,6 +137,19 @@ func (m *Manager) RecordTypingStop(channel, chatID string, stop func()) {
 	}
 }
 
+// InvokeTypingStop invokes the registered typing stop function for the given channel and chatID.
+// It is safe to call even when no typing indicator is active (no-op).
+// Used by the agent loop to stop typing when processing completes (success, error, or panic),
+// regardless of whether an outbound message is published.
+func (m *Manager) InvokeTypingStop(channel, chatID string) {
+	key := channel + ":" + chatID
+	if v, loaded := m.typingStops.LoadAndDelete(key); loaded {
+		if entry, ok := v.(typingEntry); ok {
+			entry.stop()
+		}
+	}
+}
+
 // RecordReactionUndo registers a reaction undo function for later invocation.
 // Implements PlaceholderRecorder.
 func (m *Manager) RecordReactionUndo(channel, chatID string, undo func()) {
@@ -144,7 +158,7 @@ func (m *Manager) RecordReactionUndo(channel, chatID string, undo func()) {
 }
 
 // preSend handles typing stop, reaction undo, and placeholder editing before sending a message.
-// Returns true if the message was edited into a placeholder (skip Send).
+// Returns true if the message was already delivered (skip Send).
 func (m *Manager) preSend(ctx context.Context, name string, msg bus.OutboundMessage, ch Channel) bool {
 	key := name + ":" + msg.ChatID
 
@@ -162,7 +176,22 @@ func (m *Manager) preSend(ctx context.Context, name string, msg bus.OutboundMess
 		}
 	}
 
-	// 3. Try editing placeholder
+	// 3. If a stream already finalized this message, delete the placeholder and skip send
+	if _, loaded := m.streamActive.LoadAndDelete(key); loaded {
+		if v, loaded := m.placeholders.LoadAndDelete(key); loaded {
+			if entry, ok := v.(placeholderEntry); ok && entry.id != "" {
+				// Prefer deleting the placeholder (cleaner UX than editing to same content)
+				if deleter, ok := ch.(MessageDeleter); ok {
+					deleter.DeleteMessage(ctx, msg.ChatID, entry.id) // best effort
+				} else if editor, ok := ch.(MessageEditor); ok {
+					editor.EditMessage(ctx, msg.ChatID, entry.id, msg.Content) // fallback
+				}
+			}
+		}
+		return true
+	}
+
+	// 4. Try editing placeholder
 	if v, loaded := m.placeholders.LoadAndDelete(key); loaded {
 		if entry, ok := v.(placeholderEntry); ok && entry.id != "" {
 			if editor, ok := ch.(MessageEditor); ok {
@@ -187,6 +216,9 @@ func NewManager(cfg *config.Config, messageBus *bus.MessageBus, store media.Medi
 		channelHashes: make(map[string]string),
 	}
 
+	// Register as streaming delegate so the agent loop can obtain streamers
+	messageBus.SetStreamDelegate(m)
+
 	if err := m.initChannels(&cfg.Channels); err != nil {
 		return nil, err
 	}
@@ -195,6 +227,53 @@ func NewManager(cfg *config.Config, messageBus *bus.MessageBus, store media.Medi
 	m.channelHashes = toChannelHashes(cfg)
 
 	return m, nil
+}
+
+// GetStreamer implements bus.StreamDelegate.
+// It checks if the named channel supports streaming and returns a Streamer.
+func (m *Manager) GetStreamer(ctx context.Context, channelName, chatID string) (bus.Streamer, bool) {
+	m.mu.RLock()
+	ch, exists := m.channels[channelName]
+	m.mu.RUnlock()
+
+	if !exists {
+		return nil, false
+	}
+
+	sc, ok := ch.(StreamingCapable)
+	if !ok {
+		return nil, false
+	}
+
+	streamer, err := sc.BeginStream(ctx, chatID)
+	if err != nil {
+		logger.DebugCF("channels", "Streaming unavailable, falling back to placeholder", map[string]any{
+			"channel": channelName,
+			"error":   err.Error(),
+		})
+		return nil, false
+	}
+
+	// Mark streamActive on Finalize so preSend knows to clean up the placeholder
+	key := channelName + ":" + chatID
+	return &finalizeHookStreamer{
+		Streamer:   streamer,
+		onFinalize: func() { m.streamActive.Store(key, true) },
+	}, true
+}
+
+// finalizeHookStreamer wraps a Streamer to run a hook on Finalize.
+type finalizeHookStreamer struct {
+	Streamer
+	onFinalize func()
+}
+
+func (s *finalizeHookStreamer) Finalize(ctx context.Context, content string) error {
+	if err := s.Streamer.Finalize(ctx, content); err != nil {
+		return err
+	}
+	s.onFinalize()
+	return nil
 }
 
 // initChannel is a helper that looks up a factory by name and creates the channel.
@@ -308,6 +387,10 @@ func (m *Manager) initChannels(channels *config.ChannelsConfig) error {
 
 	if channels.Pico.Enabled && channels.Pico.Token != "" {
 		m.initChannel("pico", "Pico")
+	}
+
+	if channels.PicoClient.Enabled && channels.PicoClient.URL != "" {
+		m.initChannel("pico_client", "Pico Client")
 	}
 
 	if channels.IRC.Enabled && channels.IRC.Server != "" {
