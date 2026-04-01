@@ -10,9 +10,21 @@ import (
 	"time"
 
 	"github.com/sipeed/picoclaw/pkg/config"
+	"github.com/sipeed/picoclaw/pkg/providers"
 )
 
 const modelProbeTimeout = 800 * time.Millisecond
+
+const (
+	modelStatusAvailable    = "available"
+	modelStatusUnconfigured = "unconfigured"
+	modelStatusUnreachable  = "unreachable"
+)
+
+type modelConfigurationSummary struct {
+	Available bool
+	Status    string
+}
 
 var (
 	probeTCPServiceFunc            = probeTCPService
@@ -20,9 +32,9 @@ var (
 	probeOpenAICompatibleModelFunc = probeOpenAICompatibleModel
 )
 
-func hasModelConfiguration(m config.ModelConfig) bool {
+func hasModelConfiguration(m *config.ModelConfig) bool {
 	authMethod := strings.ToLower(strings.TrimSpace(m.AuthMethod))
-	apiKey := strings.TrimSpace(m.APIKey)
+	apiKey := strings.TrimSpace(m.APIKey())
 
 	if authMethod == "oauth" || authMethod == "token" {
 		if provider, ok := oauthProviderForModel(m.Model); ok {
@@ -42,28 +54,33 @@ func hasModelConfiguration(m config.ModelConfig) bool {
 	return apiKey != ""
 }
 
-// isModelConfigured reports whether a model is currently available to use.
-// Local models must be reachable; remote/API-key models only need saved config.
-func isModelConfigured(m config.ModelConfig) bool {
+func modelConfigurationStatus(m *config.ModelConfig) modelConfigurationSummary {
 	if !hasModelConfiguration(m) {
-		return false
+		return modelConfigurationSummary{Available: false, Status: modelStatusUnconfigured}
 	}
 	if requiresRuntimeProbe(m) {
-		return probeLocalModelAvailability(m)
+		if probeLocalModelAvailability(m) {
+			return modelConfigurationSummary{Available: true, Status: modelStatusAvailable}
+		}
+		return modelConfigurationSummary{Available: false, Status: modelStatusUnreachable}
 	}
-	return true
+	return modelConfigurationSummary{Available: true, Status: modelStatusAvailable}
 }
 
-func requiresRuntimeProbe(m config.ModelConfig) bool {
+func requiresRuntimeProbe(m *config.ModelConfig) bool {
 	authMethod := strings.ToLower(strings.TrimSpace(m.AuthMethod))
 	if authMethod == "local" {
 		return true
 	}
 
-	switch modelProtocol(m.Model) {
+	protocol := modelProtocol(m.Model)
+
+	switch protocol {
 	case "claude-cli", "claudecli", "codex-cli", "codexcli", "github-copilot", "copilot":
 		return true
-	case "ollama", "vllm":
+	}
+
+	if providers.IsEmptyAPIKeyAllowedForProtocol(protocol) {
 		apiBase := strings.TrimSpace(m.APIBase)
 		return apiBase == "" || hasLocalAPIBase(apiBase)
 	}
@@ -75,36 +92,37 @@ func requiresRuntimeProbe(m config.ModelConfig) bool {
 	return false
 }
 
-func probeLocalModelAvailability(m config.ModelConfig) bool {
+func probeLocalModelAvailability(m *config.ModelConfig) bool {
 	apiBase := modelProbeAPIBase(m)
 	protocol, modelID := splitModel(m.Model)
 	switch protocol {
 	case "ollama":
 		return probeOllamaModelFunc(apiBase, modelID)
-	case "vllm":
-		return probeOpenAICompatibleModelFunc(apiBase, modelID)
+	case "vllm", "lmstudio":
+		return probeOpenAICompatibleModelFunc(apiBase, modelID, m.APIKey())
 	case "github-copilot", "copilot":
 		return probeTCPServiceFunc(apiBase)
 	case "claude-cli", "claudecli", "codex-cli", "codexcli":
 		return true
 	default:
 		if hasLocalAPIBase(apiBase) {
-			return probeOpenAICompatibleModelFunc(apiBase, modelID)
+			return probeOpenAICompatibleModelFunc(apiBase, modelID, m.APIKey())
 		}
 		return false
 	}
 }
 
-func modelProbeAPIBase(m config.ModelConfig) string {
+func modelProbeAPIBase(m *config.ModelConfig) string {
 	if apiBase := strings.TrimSpace(m.APIBase); apiBase != "" {
 		return normalizeModelProbeAPIBase(apiBase)
 	}
 
-	switch modelProtocol(m.Model) {
-	case "ollama":
-		return "http://localhost:11434/v1"
-	case "vllm":
-		return "http://localhost:8000/v1"
+	protocol := modelProtocol(m.Model)
+	if providers.IsEmptyAPIKeyAllowedForProtocol(protocol) {
+		return providers.DefaultAPIBaseForProtocol(protocol)
+	}
+
+	switch protocol {
 	case "github-copilot", "copilot":
 		return "localhost:4321"
 	default:
@@ -209,7 +227,7 @@ func probeOllamaModel(apiBase, modelID string) bool {
 			Model string `json:"model"`
 		} `json:"models"`
 	}
-	if err := getJSON(root+"/api/tags", &resp); err != nil {
+	if err := getJSON(root+"/api/tags", &resp, ""); err != nil {
 		return false
 	}
 
@@ -221,7 +239,7 @@ func probeOllamaModel(apiBase, modelID string) bool {
 	return false
 }
 
-func probeOpenAICompatibleModel(apiBase, modelID string) bool {
+func probeOpenAICompatibleModel(apiBase, modelID, apiKey string) bool {
 	if strings.TrimSpace(apiBase) == "" {
 		return false
 	}
@@ -231,7 +249,7 @@ func probeOpenAICompatibleModel(apiBase, modelID string) bool {
 			ID string `json:"id"`
 		} `json:"data"`
 	}
-	if err := getJSON(strings.TrimRight(strings.TrimSpace(apiBase), "/")+"/models", &resp); err != nil {
+	if err := getJSON(strings.TrimRight(strings.TrimSpace(apiBase), "/")+"/models", &resp, apiKey); err != nil {
 		return false
 	}
 
@@ -243,10 +261,13 @@ func probeOpenAICompatibleModel(apiBase, modelID string) bool {
 	return false
 }
 
-func getJSON(rawURL string, out any) error {
+func getJSON(rawURL string, out any, apiKey string) error {
 	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
 	if err != nil {
 		return err
+	}
+	if apiKey = strings.TrimSpace(apiKey); apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 
 	client := &http.Client{Timeout: modelProbeTimeout}

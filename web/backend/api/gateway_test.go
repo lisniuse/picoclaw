@@ -68,6 +68,7 @@ func resetGatewayTestState(t *testing.T) {
 	originalRestartGracePeriod := gatewayRestartGracePeriod
 	originalRestartForceKillWindow := gatewayRestartForceKillWindow
 	originalRestartPollInterval := gatewayRestartPollInterval
+	t.Setenv("PICOCLAW_HOME", t.TempDir())
 	t.Cleanup(func() {
 		gatewayHealthGet = originalHealthGet
 		gatewayRestartGracePeriod = originalRestartGracePeriod
@@ -76,7 +77,10 @@ func resetGatewayTestState(t *testing.T) {
 
 		gateway.mu.Lock()
 		gateway.cmd = nil
+		gateway.pidData = nil
+		gateway.owned = false
 		gateway.bootDefaultModel = ""
+		gateway.bootConfigSignature = ""
 		setGatewayRuntimeStatusLocked("stopped")
 		gateway.mu.Unlock()
 	})
@@ -101,7 +105,7 @@ func TestGatewayStartReady_NoDefaultModel(t *testing.T) {
 func TestGatewayStartReady_InvalidDefaultModel(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.json")
 	cfg := config.DefaultConfig()
-	cfg.Agents.Defaults.Model = "missing-model"
+	cfg.Agents.Defaults.ModelName = "missing-model"
 	err := config.SaveConfig(configPath, cfg)
 	if err != nil {
 		t.Fatalf("SaveConfig() error = %v", err)
@@ -124,7 +128,7 @@ func TestGatewayStartReady_ValidDefaultModel(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.json")
 	cfg := config.DefaultConfig()
 	cfg.Agents.Defaults.ModelName = cfg.ModelList[0].ModelName
-	cfg.ModelList[0].APIKey = "test-key"
+	cfg.ModelList[0].SetAPIKey("test-key")
 	err := config.SaveConfig(configPath, cfg)
 	if err != nil {
 		t.Fatalf("SaveConfig() error = %v", err)
@@ -144,7 +148,7 @@ func TestGatewayStartReady_DefaultModelWithoutCredential(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.json")
 	cfg := config.DefaultConfig()
 	cfg.Agents.Defaults.ModelName = cfg.ModelList[0].ModelName
-	cfg.ModelList[0].APIKey = ""
+	cfg.ModelList[0].SetAPIKey("")
 	cfg.ModelList[0].AuthMethod = ""
 	err := config.SaveConfig(configPath, cfg)
 	if err != nil {
@@ -164,12 +168,23 @@ func TestGatewayStartReady_DefaultModelWithoutCredential(t *testing.T) {
 	}
 }
 
+func TestGatewayCommandArgsIncludesDebugFlagWhenEnabled(t *testing.T) {
+	h := NewHandler(filepath.Join(t.TempDir(), "config.json"))
+	h.SetDebug(true)
+
+	args := h.gatewayCommandArgs()
+	want := []string{"gateway", "-E", "-d"}
+	if strings.Join(args, " ") != strings.Join(want, " ") {
+		t.Fatalf("gatewayCommandArgs() = %v, want %v", args, want)
+	}
+}
+
 func TestGatewayStartReady_LocalModelWithoutAPIKey(t *testing.T) {
 	configPath, cleanup := setupOAuthTestEnv(t)
 	defer cleanup()
 	resetModelProbeHooks(t)
 
-	probeOpenAICompatibleModelFunc = func(apiBase, modelID string) bool {
+	probeOpenAICompatibleModelFunc = func(apiBase, modelID, apiKey string) bool {
 		return false
 	}
 
@@ -177,7 +192,7 @@ func TestGatewayStartReady_LocalModelWithoutAPIKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadConfig() error = %v", err)
 	}
-	cfg.ModelList = []config.ModelConfig{{
+	cfg.ModelList = []*config.ModelConfig{{
 		ModelName: "local-vllm",
 		Model:     "vllm/custom-model",
 		APIBase:   "http://localhost:8000/v1",
@@ -206,15 +221,15 @@ func TestGatewayStartReady_LocalModelWithRunningService(t *testing.T) {
 	defer cleanup()
 	resetModelProbeHooks(t)
 
-	probeOpenAICompatibleModelFunc = func(apiBase, modelID string) bool {
-		return apiBase == "http://127.0.0.1:8000/v1" && modelID == "custom-model"
+	probeOpenAICompatibleModelFunc = func(apiBase, modelID, apiKey string) bool {
+		return apiBase == "http://127.0.0.1:8000/v1" && modelID == "custom-model" && apiKey == ""
 	}
 
 	cfg, err := config.LoadConfig(configPath)
 	if err != nil {
 		t.Fatalf("LoadConfig() error = %v", err)
 	}
-	cfg.ModelList = []config.ModelConfig{{
+	cfg.ModelList = []*config.ModelConfig{{
 		ModelName: "local-vllm",
 		Model:     "vllm/custom-model",
 		APIBase:   "http://127.0.0.1:8000/v1",
@@ -240,7 +255,7 @@ func TestGatewayStartReady_RemoteVLLMWithAPIKeyDoesNotProbe(t *testing.T) {
 	defer cleanup()
 	resetModelProbeHooks(t)
 
-	probeOpenAICompatibleModelFunc = func(apiBase, modelID string) bool {
+	probeOpenAICompatibleModelFunc = func(apiBase, modelID, apiKey string) bool {
 		t.Fatalf("unexpected OpenAI-compatible probe for %q (%q)", apiBase, modelID)
 		return false
 	}
@@ -249,12 +264,12 @@ func TestGatewayStartReady_RemoteVLLMWithAPIKeyDoesNotProbe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadConfig() error = %v", err)
 	}
-	cfg.ModelList = []config.ModelConfig{{
+	cfg.ModelList = []*config.ModelConfig{{
 		ModelName: "remote-vllm",
 		Model:     "vllm/custom-model",
 		APIBase:   "https://models.example.com/v1",
-		APIKey:    "remote-key",
 	}}
+	cfg.ModelList[0o0].SetAPIKey("remote-key")
 	cfg.Agents.Defaults.ModelName = "remote-vllm"
 	err = config.SaveConfig(configPath, cfg)
 	if err != nil {
@@ -284,7 +299,7 @@ func TestGatewayStartReady_LocalOllamaUsesDefaultProbeBase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadConfig() error = %v", err)
 	}
-	cfg.ModelList = []config.ModelConfig{{
+	cfg.ModelList = []*config.ModelConfig{{
 		ModelName: "local-ollama",
 		Model:     "ollama/llama3",
 	}}
@@ -312,7 +327,7 @@ func TestGatewayStartReady_OAuthModelRequiresStoredCredential(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadConfig() error = %v", err)
 	}
-	cfg.ModelList = []config.ModelConfig{{
+	cfg.ModelList = []*config.ModelConfig{{
 		ModelName:  "openai-oauth",
 		Model:      "openai/gpt-5.4",
 		AuthMethod: "oauth",
@@ -469,9 +484,6 @@ func TestGatewayStatusReportsRunningFromHealthProbe(t *testing.T) {
 	if got := body["gateway_status"]; got != "running" {
 		t.Fatalf("gateway_status = %#v, want %q", got, "running")
 	}
-	if got := body["pid"]; got != float64(cmd.Process.Pid) {
-		t.Fatalf("pid = %#v, want %d", got, cmd.Process.Pid)
-	}
 	if got := body["gateway_restart_required"]; got != false {
 		t.Fatalf("gateway_restart_required = %#v, want false", got)
 	}
@@ -483,12 +495,12 @@ func TestGatewayStatusRequiresRestartAfterDefaultModelChange(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.json")
 	cfg := config.DefaultConfig()
 	cfg.Agents.Defaults.ModelName = cfg.ModelList[0].ModelName
-	cfg.ModelList[0].APIKey = "test-key"
-	cfg.ModelList = append(cfg.ModelList, config.ModelConfig{
+	cfg.ModelList[0].SetAPIKey("test-key")
+	cfg.ModelList = append(cfg.ModelList, &config.ModelConfig{
 		ModelName: "second-model",
 		Model:     "openai/gpt-4.1",
-		APIKey:    "second-key",
 	})
+	cfg.ModelList[len(cfg.ModelList)-1].SetAPIKey("second-key")
 	if err := config.SaveConfig(configPath, cfg); err != nil {
 		t.Fatalf("SaveConfig() error = %v", err)
 	}
@@ -502,9 +514,11 @@ func TestGatewayStatusRequiresRestartAfterDefaultModelChange(t *testing.T) {
 		t.Fatalf("FindProcess() error = %v", err)
 	}
 
+	bootSignature := computeConfigSignature(cfg)
 	gateway.mu.Lock()
 	gateway.cmd = &exec.Cmd{Process: process}
 	gateway.bootDefaultModel = cfg.ModelList[0].ModelName
+	gateway.bootConfigSignature = bootSignature
 	setGatewayRuntimeStatusLocked("running")
 	gateway.mu.Unlock()
 
@@ -545,6 +559,188 @@ func TestGatewayStatusRequiresRestartAfterDefaultModelChange(t *testing.T) {
 	}
 	if got := body["gateway_restart_required"]; got != true {
 		t.Fatalf("gateway_restart_required = %#v, want true", got)
+	}
+}
+
+func TestGatewayStatusRequiresRestartAfterToolChange(t *testing.T) {
+	resetGatewayTestState(t)
+
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	cfg := config.DefaultConfig()
+	cfg.Agents.Defaults.ModelName = cfg.ModelList[0].ModelName
+	cfg.ModelList[0].SetAPIKey("test-key")
+	cfg.Tools.WriteFile.Enabled = true
+	if err := config.SaveConfig(configPath, cfg); err != nil {
+		t.Fatalf("SaveConfig() error = %v", err)
+	}
+
+	h := NewHandler(configPath)
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+
+	process, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		t.Fatalf("FindProcess() error = %v", err)
+	}
+
+	bootSignature := computeConfigSignature(cfg)
+	gateway.mu.Lock()
+	gateway.cmd = &exec.Cmd{Process: process}
+	gateway.bootDefaultModel = cfg.ModelList[0].ModelName
+	gateway.bootConfigSignature = bootSignature
+	setGatewayRuntimeStatusLocked("running")
+	gateway.mu.Unlock()
+
+	updatedCfg, err := config.LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+	updatedCfg.Tools.WriteFile.Enabled = false
+	if err := config.SaveConfig(configPath, updatedCfg); err != nil {
+		t.Fatalf("SaveConfig() error = %v", err)
+	}
+
+	gatewayHealthGet = func(string, time.Duration) (*http.Response, error) {
+		return mockGatewayHealthResponse(http.StatusOK, os.Getpid()), nil
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/gateway/status", nil)
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+
+	if got := body["gateway_status"]; got != "running" {
+		t.Fatalf("gateway_status = %#v, want %q", got, "running")
+	}
+	if got := body["gateway_restart_required"]; got != true {
+		t.Fatalf("gateway_restart_required = %#v, want true", got)
+	}
+}
+
+func TestGatewayStatusNoRestartRequiredForNonSensitiveChanges(t *testing.T) {
+	resetGatewayTestState(t)
+
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	cfg := config.DefaultConfig()
+	cfg.Agents.Defaults.ModelName = cfg.ModelList[0].ModelName
+	cfg.ModelList[0].SetAPIKey("test-key")
+	cfg.Agents.Defaults.MaxTokens = 1000
+	if err := config.SaveConfig(configPath, cfg); err != nil {
+		t.Fatalf("SaveConfig() error = %v", err)
+	}
+
+	h := NewHandler(configPath)
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+
+	process, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		t.Fatalf("FindProcess() error = %v", err)
+	}
+
+	bootSignature := computeConfigSignature(cfg)
+	gateway.mu.Lock()
+	gateway.cmd = &exec.Cmd{Process: process}
+	gateway.bootDefaultModel = cfg.ModelList[0].ModelName
+	gateway.bootConfigSignature = bootSignature
+	setGatewayRuntimeStatusLocked("running")
+	gateway.mu.Unlock()
+
+	updatedCfg, err := config.LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+	updatedCfg.Agents.Defaults.MaxTokens = 2000
+	if err := config.SaveConfig(configPath, updatedCfg); err != nil {
+		t.Fatalf("SaveConfig() error = %v", err)
+	}
+
+	gatewayHealthGet = func(string, time.Duration) (*http.Response, error) {
+		return mockGatewayHealthResponse(http.StatusOK, os.Getpid()), nil
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/gateway/status", nil)
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+
+	if got := body["gateway_status"]; got != "running" {
+		t.Fatalf("gateway_status = %#v, want %q", got, "running")
+	}
+	if got := body["gateway_restart_required"]; got != false {
+		t.Fatalf("gateway_restart_required = %#v, want false", got)
+	}
+}
+
+func TestGatewayStatusNoRestartRequiredWhenNotRunning(t *testing.T) {
+	resetGatewayTestState(t)
+
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	cfg := config.DefaultConfig()
+	cfg.Agents.Defaults.ModelName = cfg.ModelList[0].ModelName
+	cfg.ModelList[0].SetAPIKey("test-key")
+	if err := config.SaveConfig(configPath, cfg); err != nil {
+		t.Fatalf("SaveConfig() error = %v", err)
+	}
+
+	h := NewHandler(configPath)
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+
+	gateway.mu.Lock()
+	gateway.cmd = nil
+	gateway.bootDefaultModel = ""
+	gateway.bootConfigSignature = ""
+	setGatewayRuntimeStatusLocked("stopped")
+	gateway.mu.Unlock()
+
+	updatedCfg, err := config.LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+	updatedCfg.Agents.Defaults.ModelName = "different-model"
+	if err := config.SaveConfig(configPath, updatedCfg); err != nil {
+		t.Fatalf("SaveConfig() error = %v", err)
+	}
+
+	gatewayHealthGet = func(string, time.Duration) (*http.Response, error) {
+		return nil, errors.New("no gateway running")
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/gateway/status", nil)
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+
+	if got := body["gateway_status"]; got != "stopped" {
+		t.Fatalf("gateway_status = %#v, want %q", got, "stopped")
+	}
+	if got := body["gateway_restart_required"]; got != false {
+		t.Fatalf("gateway_restart_required = %#v, want false", got)
 	}
 }
 
@@ -596,6 +792,11 @@ func TestGatewayStatusReturnsErrorAfterStartupWindowExpires(t *testing.T) {
 func TestGatewayStatusReturnsRestartingDuringRestartGap(t *testing.T) {
 	resetGatewayTestState(t)
 
+	// Mock health check to return error, so it won't override our "restarting" status
+	gatewayHealthGet = func(url string, timeout time.Duration) (*http.Response, error) {
+		return nil, errors.New("mock health check error")
+	}
+
 	configPath := filepath.Join(t.TempDir(), "config.json")
 	h := NewHandler(configPath)
 	mux := http.NewServeMux()
@@ -627,7 +828,7 @@ func TestGatewayRestartKeepsRunningProcessWhenPreconditionsFail(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.json")
 	cfg := config.DefaultConfig()
 	cfg.Agents.Defaults.ModelName = cfg.ModelList[0].ModelName
-	cfg.ModelList[0].APIKey = ""
+	cfg.ModelList[0].SetAPIKey("")
 	cfg.ModelList[0].AuthMethod = ""
 	if err := config.SaveConfig(configPath, cfg); err != nil {
 		t.Fatalf("SaveConfig() error = %v", err)
@@ -680,7 +881,7 @@ func TestGatewayRestartKeepsOldProcessWhenItDoesNotExitInTime(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.json")
 	cfg := config.DefaultConfig()
 	cfg.Agents.Defaults.ModelName = cfg.ModelList[0].ModelName
-	cfg.ModelList[0].APIKey = "test-key"
+	cfg.ModelList[0].SetAPIKey("test-key")
 	if err := config.SaveConfig(configPath, cfg); err != nil {
 		t.Fatalf("SaveConfig() error = %v", err)
 	}
@@ -738,10 +939,15 @@ func TestGatewayRestartKeepsOldProcessWhenItDoesNotExitInTime(t *testing.T) {
 func TestGatewayRestartReturnsErrorStatusWhenReplacementFailsToStart(t *testing.T) {
 	resetGatewayTestState(t)
 
+	// Mock health check to return error, so it won't override our "error" status
+	gatewayHealthGet = func(url string, timeout time.Duration) (*http.Response, error) {
+		return nil, errors.New("mock health check error")
+	}
+
 	configPath := filepath.Join(t.TempDir(), "config.json")
 	cfg := config.DefaultConfig()
 	cfg.Agents.Defaults.ModelName = cfg.ModelList[0].ModelName
-	cfg.ModelList[0].APIKey = "test-key"
+	cfg.ModelList[0].SetAPIKey("test-key")
 	if err := config.SaveConfig(configPath, cfg); err != nil {
 		t.Fatalf("SaveConfig() error = %v", err)
 	}

@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -20,13 +21,13 @@ import (
 	_ "github.com/sipeed/picoclaw/pkg/channels/irc"
 	_ "github.com/sipeed/picoclaw/pkg/channels/line"
 	_ "github.com/sipeed/picoclaw/pkg/channels/maixcam"
-	_ "github.com/sipeed/picoclaw/pkg/channels/matrix"
 	_ "github.com/sipeed/picoclaw/pkg/channels/onebot"
-	_ "github.com/sipeed/picoclaw/pkg/channels/pico"
+	"github.com/sipeed/picoclaw/pkg/channels/pico"
 	_ "github.com/sipeed/picoclaw/pkg/channels/qq"
 	_ "github.com/sipeed/picoclaw/pkg/channels/slack"
 	_ "github.com/sipeed/picoclaw/pkg/channels/telegram"
 	_ "github.com/sipeed/picoclaw/pkg/channels/wecom"
+	_ "github.com/sipeed/picoclaw/pkg/channels/weixin"
 	_ "github.com/sipeed/picoclaw/pkg/channels/whatsapp"
 	_ "github.com/sipeed/picoclaw/pkg/channels/whatsapp_native"
 	"github.com/sipeed/picoclaw/pkg/config"
@@ -36,6 +37,7 @@ import (
 	"github.com/sipeed/picoclaw/pkg/heartbeat"
 	"github.com/sipeed/picoclaw/pkg/logger"
 	"github.com/sipeed/picoclaw/pkg/media"
+	"github.com/sipeed/picoclaw/pkg/pid"
 	"github.com/sipeed/picoclaw/pkg/providers"
 	"github.com/sipeed/picoclaw/pkg/state"
 	"github.com/sipeed/picoclaw/pkg/tools"
@@ -46,6 +48,10 @@ const (
 	serviceShutdownTimeout  = 30 * time.Second
 	providerReloadTimeout   = 30 * time.Second
 	gracefulShutdownTimeout = 15 * time.Second
+
+	logPath   = "logs"
+	panicFile = "gateway_panic.log"
+	logFile   = "gateway.log"
 )
 
 type services struct {
@@ -57,6 +63,7 @@ type services struct {
 	HealthServer     *health.Server
 	manualReloadChan chan struct{}
 	reloading        atomic.Bool
+	authToken        string
 }
 
 type startupBlockedProvider struct {
@@ -78,16 +85,49 @@ func (p *startupBlockedProvider) GetDefaultModel() string {
 }
 
 // Run starts the gateway runtime using the configuration loaded from configPath.
-func Run(debug bool, configPath string, allowEmptyStartup bool) error {
+func Run(debug bool, homePath, configPath string, allowEmptyStartup bool) error {
+	panicPath := filepath.Join(homePath, logPath, panicFile)
+	panicFunc, err := logger.InitPanic(panicPath)
+	if err != nil {
+		return fmt.Errorf("error initializing panic log: %w", err)
+	}
+	defer panicFunc()
+
+	if err = logger.EnableFileLogging(filepath.Join(homePath, logPath, logFile)); err != nil {
+		logger.Fatal(fmt.Sprintf("error enabling file logging: %v", err))
+	}
+	defer logger.DisableFileLogging()
+
 	if debug {
 		logger.SetLevel(logger.DEBUG)
-		fmt.Println("🔍 Debug mode enabled")
+	} else {
+		logger.SetLevelFromString(config.ResolveGatewayLogLevel(configPath))
 	}
 
 	cfg, err := config.LoadConfig(configPath)
 	if err != nil {
-		return fmt.Errorf("error loading config: %w", err)
+		logger.Fatalf("error loading config: %v", err)
 	}
+
+	if err = preCheckConfig(cfg); err != nil {
+		logger.Fatalf("config pre-check failed: %v", err)
+	}
+
+	// Debug mode permanently overrides the config log level to DEBUG.
+	if debug {
+		fmt.Println("🔍 Debug mode enabled")
+	} else {
+		effectiveLogLevel := config.EffectiveGatewayLogLevel(cfg)
+		logger.SetLevelFromString(effectiveLogLevel)
+		logger.Infof("Log level set to %q", effectiveLogLevel)
+	}
+
+	// Enforce singleton: write PID file with generated token.
+	pidData, err := pid.WritePidFile(homePath, cfg.Gateway.Host, cfg.Gateway.Port)
+	if err != nil {
+		return fmt.Errorf("singleton check failed: %w", err)
+	}
+	defer pid.RemovePidFile(homePath)
 
 	provider, modelID, err := createStartupProvider(cfg, allowEmptyStartup)
 	if err != nil {
@@ -115,7 +155,7 @@ func Run(debug bool, configPath string, allowEmptyStartup bool) error {
 			"skills_available": skillsInfo["available"],
 		})
 
-	runningServices, err := setupAndStartServices(cfg, agentLoop, msgBus)
+	runningServices, err := setupAndStartServices(cfg, agentLoop, msgBus, pidData.Token)
 	if err != nil {
 		return err
 	}
@@ -169,7 +209,7 @@ func Run(debug bool, configPath string, allowEmptyStartup bool) error {
 				logger.Warn("Config reload skipped: another reload is in progress")
 				continue
 			}
-			err := executeReload(ctx, agentLoop, newCfg, &provider, runningServices, msgBus, allowEmptyStartup)
+			err := executeReload(ctx, agentLoop, newCfg, &provider, runningServices, msgBus, allowEmptyStartup, debug)
 			if err != nil {
 				logger.Errorf("Config reload failed: %v", err)
 			}
@@ -186,7 +226,7 @@ func Run(debug bool, configPath string, allowEmptyStartup bool) error {
 				runningServices.reloading.Store(false)
 				continue
 			}
-			err = executeReload(ctx, agentLoop, newCfg, &provider, runningServices, msgBus, allowEmptyStartup)
+			err = executeReload(ctx, agentLoop, newCfg, &provider, runningServices, msgBus, allowEmptyStartup, debug)
 			if err != nil {
 				logger.Errorf("Manual reload failed: %v", err)
 			} else {
@@ -194,6 +234,13 @@ func Run(debug bool, configPath string, allowEmptyStartup bool) error {
 			}
 		}
 	}
+}
+
+func preCheckConfig(cfg *config.Config) error {
+	if cfg.Gateway.Port <= 0 || cfg.Gateway.Port > 65535 {
+		return fmt.Errorf("invalid gateway port: %d, port must be between 1 and 65535", cfg.Gateway.Port)
+	}
+	return nil
 }
 
 func executeReload(
@@ -204,9 +251,13 @@ func executeReload(
 	runningServices *services,
 	msgBus *bus.MessageBus,
 	allowEmptyStartup bool,
+	debug bool,
 ) error {
 	defer runningServices.reloading.Store(false)
-	return handleConfigReload(ctx, agentLoop, newCfg, provider, runningServices, msgBus, allowEmptyStartup)
+
+	overridePicoToken(newCfg, runningServices.authToken)
+
+	return handleConfigReload(ctx, agentLoop, newCfg, provider, runningServices, msgBus, allowEmptyStartup, debug)
 }
 
 func createStartupProvider(
@@ -230,6 +281,7 @@ func setupAndStartServices(
 	cfg *config.Config,
 	agentLoop *agent.AgentLoop,
 	msgBus *bus.MessageBus,
+	authToken string,
 ) (*services, error) {
 	runningServices := &services{}
 
@@ -272,6 +324,8 @@ func setupAndStartServices(
 		fms.Start()
 	}
 
+	overridePicoToken(cfg, authToken)
+
 	runningServices.ChannelManager, err = channels.NewManager(cfg, msgBus, runningServices.MediaStore)
 	if err != nil {
 		if fms, ok := runningServices.MediaStore.(*media.FileMediaStore); ok {
@@ -296,7 +350,8 @@ func setupAndStartServices(
 	}
 
 	addr := fmt.Sprintf("%s:%d", cfg.Gateway.Host, cfg.Gateway.Port)
-	runningServices.HealthServer = health.NewServer(cfg.Gateway.Host, cfg.Gateway.Port)
+	runningServices.authToken = authToken
+	runningServices.HealthServer = health.NewServer(cfg.Gateway.Host, cfg.Gateway.Port, authToken)
 	runningServices.ChannelManager.SetupHTTPServer(addr, runningServices.HealthServer)
 
 	if err = runningServices.ChannelManager.StartAll(context.Background()); err != nil {
@@ -374,13 +429,11 @@ func handleConfigReload(
 	runningServices *services,
 	msgBus *bus.MessageBus,
 	allowEmptyStartup bool,
+	debug bool,
 ) error {
 	logger.Info("🔄 Config file changed, reloading...")
 
 	newModel := newCfg.Agents.Defaults.ModelName
-	if newModel == "" {
-		newModel = newCfg.Agents.Defaults.Model
-	}
 
 	logger.Infof(" New model is '%s', recreating provider...", newModel)
 
@@ -425,6 +478,15 @@ func handleConfigReload(
 	}
 
 	logger.Info("  ✓ Provider, configuration, and services reloaded successfully (thread-safe)")
+
+	// Debug mode permanently overrides the config log level to DEBUG.
+	if !debug {
+		// Update log level last so that reload-related info/warn logs above are not suppressed.
+		effectiveLogLevel := config.EffectiveGatewayLogLevel(newCfg)
+		logger.SetLevelFromString(effectiveLogLevel)
+		logger.Infof("Log level changing from current to %q", effectiveLogLevel)
+	}
+
 	return nil
 }
 
@@ -475,11 +537,12 @@ func restartServices(
 	}
 	al.SetMediaStore(runningServices.MediaStore)
 
-	runningServices.ChannelManager, err = channels.NewManager(cfg, msgBus, runningServices.MediaStore)
-	if err != nil {
-		return fmt.Errorf("error recreating channel manager: %w", err)
-	}
 	al.SetChannelManager(runningServices.ChannelManager)
+
+	if err = runningServices.ChannelManager.Reload(context.Background(), cfg); err != nil {
+		return fmt.Errorf("error reload channels: %w", err)
+	}
+	fmt.Println("  ✓ Channels restarted.")
 
 	enabledChannels := runningServices.ChannelManager.GetEnabledChannels()
 	if len(enabledChannels) > 0 {
@@ -487,18 +550,6 @@ func restartServices(
 	} else {
 		fmt.Println("  ⚠ Warning: No channels enabled")
 	}
-
-	addr := fmt.Sprintf("%s:%d", cfg.Gateway.Host, cfg.Gateway.Port)
-	// Reuse existing HealthServer to preserve reloadFunc
-	if runningServices.HealthServer == nil {
-		runningServices.HealthServer = health.NewServer(cfg.Gateway.Host, cfg.Gateway.Port)
-	}
-	runningServices.ChannelManager.SetupHTTPServer(addr, runningServices.HealthServer)
-
-	if err = runningServices.ChannelManager.Reload(context.Background(), cfg); err != nil {
-		return fmt.Errorf("error reload channels: %w", err)
-	}
-	fmt.Println("  ✓ Channels restarted.")
 
 	stateManager := state.NewManager(cfg.WorkspacePath())
 	runningServices.DeviceService = devices.NewService(devices.Config{
@@ -519,6 +570,9 @@ func restartServices(
 	} else {
 		logger.InfoCF("voice", "Transcription disabled", nil)
 	}
+
+	// NOTE: PID file is written once at startup and not updated on reload.
+	// Changing the gateway listen address requires a full restart.
 
 	return nil
 }
@@ -636,6 +690,20 @@ func setupCronTool(
 	}
 
 	return cronService, nil
+}
+
+// overridePicoToken replaces the pico channel token with the one from the PID file.
+// The PID file is the single source of truth for the pico auth token;
+// it is generated once at gateway startup and remains unchanged across reloads.
+func overridePicoToken(cfg *config.Config, token string) {
+	if !cfg.Channels.Pico.Enabled {
+		return
+	}
+	picoToken := cfg.Channels.Pico.Token.String()
+	if picoToken == "" || strings.HasPrefix(picoToken, pico.PicoTokenPrefix) {
+		return
+	}
+	cfg.Channels.Pico.SetToken(pico.PicoTokenPrefix + token + picoToken)
 }
 
 func createHeartbeatHandler(agentLoop *agent.AgentLoop) func(prompt, channel, chatID string) *tools.ToolResult {

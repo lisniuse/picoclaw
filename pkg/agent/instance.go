@@ -49,6 +49,9 @@ type AgentInstance struct {
 	// LightCandidates holds the resolved provider candidates for the light model.
 	// Pre-computed at agent creation to avoid repeated model_list lookups at runtime.
 	LightCandidates []providers.FallbackCandidate
+	// LightProvider is the concrete provider instance for the configured light model.
+	// It is only used when routing selects the light tier for a turn.
+	LightProvider providers.LLMProvider
 }
 
 // NewAgentInstance creates an agent instance from config.
@@ -104,10 +107,12 @@ func NewAgentInstance(
 	sessions := initSessionStore(sessionsDir)
 
 	mcpDiscoveryActive := cfg.Tools.MCP.Enabled && cfg.Tools.MCP.Discovery.Enabled
-	contextBuilder := NewContextBuilder(workspace).WithToolDiscovery(
-		mcpDiscoveryActive && cfg.Tools.MCP.Discovery.UseBM25,
-		mcpDiscoveryActive && cfg.Tools.MCP.Discovery.UseRegex,
-	)
+	contextBuilder := NewContextBuilder(workspace).
+		WithToolDiscovery(
+			mcpDiscoveryActive && cfg.Tools.MCP.Discovery.UseBM25,
+			mcpDiscoveryActive && cfg.Tools.MCP.Discovery.UseRegex,
+		).
+		WithSplitOnMarker(cfg.Agents.Defaults.SplitOnMarker)
 
 	agentID := routing.DefaultAgentID
 	agentName := ""
@@ -129,6 +134,17 @@ func NewAgentInstance(
 	maxTokens := defaults.MaxTokens
 	if maxTokens == 0 {
 		maxTokens = 8192
+	}
+
+	contextWindow := defaults.ContextWindow
+	if contextWindow == 0 {
+		// Default heuristic: 4x the output token limit.
+		// Most models have context windows well above their output limits
+		// (e.g., GPT-4o 128k ctx / 16k out, Claude 200k ctx / 8k out).
+		// 4x is a conservative lower bound that avoids premature
+		// summarization while remaining safe — the reactive
+		// forceCompression handles any overshoot.
+		contextWindow = maxTokens * 4
 	}
 
 	temperature := 0.7
@@ -161,14 +177,28 @@ func NewAgentInstance(
 	// to avoid repeated model_list lookups on every incoming message.
 	var router *routing.Router
 	var lightCandidates []providers.FallbackCandidate
+	var lightProvider providers.LLMProvider
 	if rc := defaults.Routing; rc != nil && rc.Enabled && rc.LightModel != "" {
 		resolved := resolveModelCandidates(cfg, defaults.Provider, rc.LightModel, nil)
 		if len(resolved) > 0 {
-			router = routing.New(routing.RouterConfig{
-				LightModel: rc.LightModel,
-				Threshold:  rc.Threshold,
-			})
-			lightCandidates = resolved
+			lightModelCfg, err := resolvedModelConfig(cfg, rc.LightModel, workspace)
+			if err != nil {
+				logger.WarnCF("agent", "Routing light model config invalid; routing disabled",
+					map[string]any{"light_model": rc.LightModel, "agent_id": agentID, "error": err.Error()})
+			} else {
+				lp, _, err := providers.CreateProviderFromConfig(lightModelCfg)
+				if err != nil {
+					logger.WarnCF("agent", "Routing light model provider init failed; routing disabled",
+						map[string]any{"light_model": rc.LightModel, "agent_id": agentID, "error": err.Error()})
+				} else {
+					router = routing.New(routing.RouterConfig{
+						LightModel: rc.LightModel,
+						Threshold:  rc.Threshold,
+					})
+					lightCandidates = resolved
+					lightProvider = lp
+				}
+			}
 		} else {
 			logger.WarnCF("agent", "Routing light model not found; routing disabled",
 				map[string]any{"light_model": rc.LightModel, "agent_id": agentID})
@@ -186,7 +216,7 @@ func NewAgentInstance(
 		Temperature:               temperature,
 		ThinkingLevel:             thinkingLevel,
 		StripThinkingTags:         stripThinkingTags,
-		ContextWindow:             maxTokens,
+		ContextWindow:             contextWindow,
 		SummarizeMessageThreshold: summarizeMessageThreshold,
 		SummarizeTokenPercent:     summarizeTokenPercent,
 		Provider:                  provider,
@@ -198,6 +228,7 @@ func NewAgentInstance(
 		Candidates:                candidates,
 		Router:                    router,
 		LightCandidates:           lightCandidates,
+		LightProvider:             lightProvider,
 	}
 }
 
