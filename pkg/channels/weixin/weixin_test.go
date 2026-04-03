@@ -289,6 +289,47 @@ func TestSessionPauseGuard(t *testing.T) {
 	}
 }
 
+func TestClassifyOutboundSendError_PreservesAPIResponseDetails(t *testing.T) {
+	ch := &WeixinChannel{
+		typingCache: make(map[string]typingTicketCacheEntry),
+	}
+
+	err := ch.classifyOutboundSendError("weixin send", &weixinAPIResponseError{
+		Operation: "sendmessage",
+		Ret:       -2,
+		Errcode:   0,
+		Errmsg:    "",
+	})
+
+	if !errors.Is(err, basechannels.ErrSendFailed) {
+		t.Fatalf("classifyOutboundSendError() error = %v, want ErrSendFailed", err)
+	}
+	if got := err.Error(); got != "weixin send: send failed: sendmessage failed (ret=-2 errcode=0 errmsg=): conversation context appears expired; ask the user to send a new Weixin message first" {
+		t.Fatalf("classifyOutboundSendError() = %q", got)
+	}
+}
+
+func TestClassifyOutboundSendError_UsesSendFailedWhenSessionPaused(t *testing.T) {
+	ch := &WeixinChannel{
+		typingCache: make(map[string]typingTicketCacheEntry),
+	}
+	ch.pauseSession("sendmessage", 0, weixinSessionExpiredCode, "expired")
+
+	err := ch.classifyOutboundSendError("weixin send", &weixinAPIResponseError{
+		Operation: "sendmessage",
+		Ret:       -14,
+		Errcode:   0,
+		Errmsg:    "expired",
+	})
+
+	if !errors.Is(err, basechannels.ErrSendFailed) {
+		t.Fatalf("classifyOutboundSendError() error = %v, want ErrSendFailed", err)
+	}
+	if got := err.Error(); got != "weixin send: send failed: sendmessage failed (ret=-14 errcode=0 errmsg=expired)" {
+		t.Fatalf("classifyOutboundSendError() = %q", got)
+	}
+}
+
 func TestSelectInboundMediaItemFallsBackToRefMessage(t *testing.T) {
 	msg := WeixinMessage{
 		ItemList: []MessageItem{

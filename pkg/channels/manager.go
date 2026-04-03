@@ -8,6 +8,7 @@ package channels
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -447,12 +448,49 @@ func (m *Manager) SetupHTTPServer(addr string, healthServer *health.Server) {
 	// Discover and register webhook handlers and health checkers
 	m.registerHTTPHandlersLocked()
 
+	// Register direct send endpoint
+	m.mux.HandleFunc("/v1/send", m.handleSend)
+
 	m.httpServer = &http.Server{
 		Addr:         addr,
 		Handler:      m.mux,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
 	}
+}
+
+// handleSend handles POST /v1/send for directly sending a message to a channel.
+func (m *Manager) handleSend(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"method not allowed, use POST"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Channel string `json:"channel"`
+		To      string `json:"to"`
+		Content string `json:"content"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
+		return
+	}
+	if req.Channel == "" || req.To == "" || req.Content == "" {
+		http.Error(w, `{"error":"channel, to and content are required"}`, http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	if err := m.SendMessage(ctx, bus.OutboundMessage{
+		Channel: req.Channel,
+		ChatID:  req.To,
+		Content: req.Content,
+	}); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, `{"ok":true}`)
 }
 
 // registerHTTPHandlersLocked registers webhook and health-check handlers for
@@ -738,21 +776,21 @@ func splitByLength(content string, maxLen int) []string {
 //   - ErrNotRunning / ErrSendFailed: permanent, no retry
 //   - ErrRateLimit: fixed delay retry
 //   - ErrTemporary / unknown: exponential backoff retry
-func (m *Manager) sendWithRetry(
+func (m *Manager) sendWithRetryResult(
 	ctx context.Context,
 	name string,
 	w *channelWorker,
 	msg bus.OutboundMessage,
-) ([]string, bool) {
+) ([]string, error) {
 	// Rate limit: wait for token
 	if err := w.limiter.Wait(ctx); err != nil {
 		// ctx canceled, shutting down
-		return nil, false
+		return nil, err
 	}
 
 	// Pre-send: stop typing and try to edit placeholder
 	if msgIDs, handled := m.preSend(ctx, name, msg, w.ch); handled {
-		return msgIDs, true
+		return msgIDs, nil
 	}
 
 	var lastErr error
@@ -760,7 +798,7 @@ func (m *Manager) sendWithRetry(
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		msgIDs, lastErr = w.ch.Send(ctx, msg)
 		if lastErr == nil {
-			return msgIDs, true
+			return msgIDs, nil
 		}
 
 		// Permanent failures — don't retry
@@ -779,7 +817,7 @@ func (m *Manager) sendWithRetry(
 			case <-time.After(rateLimitDelay):
 				continue
 			case <-ctx.Done():
-				return nil, false
+				return nil, ctx.Err()
 			}
 		}
 
@@ -788,7 +826,7 @@ func (m *Manager) sendWithRetry(
 		select {
 		case <-time.After(backoff):
 		case <-ctx.Done():
-			return nil, false
+			return nil, ctx.Err()
 		}
 	}
 
@@ -800,7 +838,17 @@ func (m *Manager) sendWithRetry(
 		"retries": maxRetries,
 	})
 
-	return nil, false
+	return nil, lastErr
+}
+
+func (m *Manager) sendWithRetry(
+	ctx context.Context,
+	name string,
+	w *channelWorker,
+	msg bus.OutboundMessage,
+) ([]string, bool) {
+	msgIDs, err := m.sendWithRetryResult(ctx, name, w, msg)
+	return msgIDs, err == nil
 }
 
 func dispatchLoop[M any](
@@ -1189,10 +1237,14 @@ func (m *Manager) SendMessage(ctx context.Context, msg bus.OutboundMessage) erro
 		for _, chunk := range SplitMessage(msg.Content, maxLen) {
 			chunkMsg := msg
 			chunkMsg.Content = chunk
-			m.sendWithRetry(ctx, msg.Channel, w, chunkMsg)
+			if _, err := m.sendWithRetryResult(ctx, msg.Channel, w, chunkMsg); err != nil {
+				return err
+			}
 		}
 	} else {
-		m.sendWithRetry(ctx, msg.Channel, w, msg)
+		if _, err := m.sendWithRetryResult(ctx, msg.Channel, w, msg); err != nil {
+			return err
+		}
 	}
 	return nil
 }

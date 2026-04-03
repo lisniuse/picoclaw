@@ -910,10 +910,21 @@ func (c *WeixinChannel) sendMessageItem(
 	contextToken string,
 	item MessageItem,
 ) error {
+	clientID := "picoclaw-" + uuid.New().String()
+	logger.DebugCF("weixin", "Sending outbound message", map[string]any{
+		"to_user_id":          toUserID,
+		"client_id":           clientID,
+		"message_state":       MessageStateFinish,
+		"message_type":        MessageTypeBot,
+		"item_type":           item.Type,
+		"context_token_len":   len(contextToken),
+		"context_token_short": summarizeContextToken(contextToken),
+	})
+
 	resp, err := c.api.SendMessage(ctx, SendMessageReq{
 		Msg: WeixinMessage{
 			ToUserID:     toUserID,
-			ClientID:     "picoclaw-" + uuid.New().String(),
+			ClientID:     clientID,
 			MessageType:  MessageTypeBot,
 			MessageState: MessageStateFinish,
 			ItemList:     []MessageItem{item},
@@ -930,9 +941,35 @@ func (c *WeixinChannel) sendMessageItem(
 		if isSessionExpiredStatus(resp.Ret, resp.Errcode) {
 			c.pauseSession("sendmessage", resp.Ret, resp.Errcode, resp.Errmsg)
 		}
-		return fmt.Errorf("sendmessage failed: ret=%d errcode=%d errmsg=%s", resp.Ret, resp.Errcode, resp.Errmsg)
+		logger.ErrorCF("weixin", "Weixin sendmessage API returned error", map[string]any{
+			"to_user_id":          toUserID,
+			"client_id":           clientID,
+			"item_type":           item.Type,
+			"context_token_len":   len(contextToken),
+			"context_token_short": summarizeContextToken(contextToken),
+			"ret":                 resp.Ret,
+			"errcode":             resp.Errcode,
+			"errmsg":              resp.Errmsg,
+		})
+		return &weixinAPIResponseError{
+			Operation: "sendmessage",
+			Ret:       resp.Ret,
+			Errcode:   resp.Errcode,
+			Errmsg:    resp.Errmsg,
+		}
 	}
 	return nil
+}
+
+func summarizeContextToken(token string) string {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return ""
+	}
+	if len(token) <= 8 {
+		return token
+	}
+	return token[:8]
 }
 
 func (c *WeixinChannel) sendTextMessage(
@@ -1146,10 +1183,7 @@ func (c *WeixinChannel) SendMedia(ctx context.Context, msg bus.OutboundMediaMess
 				"ref":     part.Ref,
 				"error":   err.Error(),
 			})
-			if c.remainingPause() > 0 {
-				return nil, fmt.Errorf("weixin send media: %w", basechannels.ErrSendFailed)
-			}
-			return nil, fmt.Errorf("weixin send media: %w", basechannels.ErrTemporary)
+			return nil, c.classifyOutboundSendError("weixin send media", err)
 		}
 	}
 

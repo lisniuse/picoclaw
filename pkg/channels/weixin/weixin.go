@@ -2,6 +2,7 @@ package weixin
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -101,7 +102,7 @@ func (c *WeixinChannel) restoreContextTokens() {
 }
 
 // persistContextTokens saves all in-memory context tokens to disk.
-func (c *WeixinChannel) persistContextTokens() {
+func (c *WeixinChannel) persistContextTokens(lastUserID string) {
 	tokens := make(map[string]string)
 	c.contextTokens.Range(func(k, v any) bool {
 		if userID, ok := k.(string); ok {
@@ -111,7 +112,7 @@ func (c *WeixinChannel) persistContextTokens() {
 		}
 		return true
 	})
-	if err := saveContextTokens(c.contextTokensPath, tokens); err != nil {
+	if err := saveContextTokens(c.contextTokensPath, tokens, lastUserID); err != nil {
 		logger.WarnCF("weixin", "Failed to persist context tokens", map[string]any{
 			"path":  c.contextTokensPath,
 			"error": err.Error(),
@@ -351,7 +352,7 @@ func (c *WeixinChannel) handleInboundMessage(ctx context.Context, msg WeixinMess
 	// Store context_token for outbound reply association
 	if msg.ContextToken != "" {
 		c.contextTokens.Store(fromUserID, msg.ContextToken)
-		c.persistContextTokens()
+		c.persistContextTokens(fromUserID)
 	}
 
 	c.HandleMessage(ctx, peer, messageID, fromUserID, fromUserID, content, mediaRefs, metadata, sender)
@@ -394,13 +395,79 @@ func (c *WeixinChannel) Send(ctx context.Context, msg bus.OutboundMessage) ([]st
 			"to_user_id": toUserID,
 			"error":      err.Error(),
 		})
-		if c.remainingPause() > 0 {
-			return nil, fmt.Errorf("weixin send: %w", channels.ErrSendFailed)
-		}
-		return nil, fmt.Errorf("weixin send: %w", channels.ErrTemporary)
+		return nil, c.classifyOutboundSendError("weixin send", err)
 	}
 
 	return nil, nil
+}
+
+type weixinAPIResponseError struct {
+	Operation string
+	Ret       int
+	Errcode   int
+	Errmsg    string
+}
+
+func (e *weixinAPIResponseError) Error() string {
+	if e == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf("%s failed: ret=%d errcode=%d errmsg=%s", e.Operation, e.Ret, e.Errcode, e.Errmsg)
+}
+
+func (c *WeixinChannel) classifyOutboundSendError(prefix string, err error) error {
+	if err == nil {
+		return nil
+	}
+
+	sentinel := channels.ErrTemporary
+	var apiErr *weixinAPIResponseError
+	if errors.As(err, &apiErr) {
+		if c.remainingPause() > 0 || isPermanentSendMessageFailure(apiErr) {
+			sentinel = channels.ErrSendFailed
+		}
+		return fmt.Errorf(
+			"%s: %w: %s",
+			prefix,
+			sentinel,
+			describeWeixinAPIResponseError(apiErr),
+		)
+	}
+
+	if c.remainingPause() > 0 {
+		sentinel = channels.ErrSendFailed
+	}
+	return fmt.Errorf("%s: %w: %v", prefix, sentinel, err)
+}
+
+func isPermanentSendMessageFailure(err *weixinAPIResponseError) bool {
+	if err == nil {
+		return false
+	}
+	if err.Operation != "sendmessage" {
+		return false
+	}
+
+	switch {
+	case err.Ret == -2:
+		return true
+	case err.Errcode == -2:
+		return true
+	default:
+		return false
+	}
+}
+
+func describeWeixinAPIResponseError(err *weixinAPIResponseError) string {
+	if err == nil {
+		return ""
+	}
+
+	base := fmt.Sprintf("%s failed (ret=%d errcode=%d errmsg=%s)", err.Operation, err.Ret, err.Errcode, err.Errmsg)
+	if err.Operation == "sendmessage" && (err.Ret == -2 || err.Errcode == -2) {
+		return base + ": conversation context appears expired; ask the user to send a new Weixin message first"
+	}
+	return base
 }
 
 // VoiceCapabilities returns the voice capabilities of the channel.

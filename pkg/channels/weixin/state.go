@@ -37,7 +37,8 @@ type syncCursorFile struct {
 }
 
 type contextTokensFile struct {
-	Tokens map[string]string `json:"tokens"`
+	Tokens     map[string]string `json:"tokens"`
+	LastUserID string            `json:"last_user_id,omitempty"`
 }
 
 func picoclawHomeDir() string {
@@ -86,23 +87,31 @@ func saveGetUpdatesBuf(path, cursor string) error {
 	return fileutil.WriteFileAtomic(path, data, 0o600)
 }
 
-func loadContextTokens(path string) (map[string]string, error) {
+func loadContextTokensState(path string) (contextTokensFile, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return contextTokensFile{}, nil
 		}
-		return nil, err
+		return contextTokensFile{}, err
 	}
 	var decoded contextTokensFile
 	if err := json.Unmarshal(data, &decoded); err != nil {
+		return contextTokensFile{}, err
+	}
+	return decoded, nil
+}
+
+func loadContextTokens(path string) (map[string]string, error) {
+	decoded, err := loadContextTokensState(path)
+	if err != nil {
 		return nil, err
 	}
 	return decoded.Tokens, nil
 }
 
-func saveContextTokens(path string, tokens map[string]string) error {
-	data, err := json.Marshal(contextTokensFile{Tokens: tokens})
+func saveContextTokens(path string, tokens map[string]string, lastUserID string) error {
+	data, err := json.Marshal(contextTokensFile{Tokens: tokens, LastUserID: lastUserID})
 	if err != nil {
 		return err
 	}

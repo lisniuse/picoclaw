@@ -1385,6 +1385,35 @@ func TestSendMessage_WithRetry(t *testing.T) {
 	}
 }
 
+func TestSendMessage_PropagatesFailure(t *testing.T) {
+	m := newTestManager()
+
+	ch := &mockChannel{
+		sendFn: func(_ context.Context, _ bus.OutboundMessage) error {
+			return fmt.Errorf("bad chat ID: %w", ErrSendFailed)
+		},
+	}
+
+	w := &channelWorker{
+		ch:      ch,
+		limiter: rate.NewLimiter(rate.Inf, 1),
+	}
+	m.channels["test"] = ch
+	m.workers["test"] = w
+
+	err := m.SendMessage(context.Background(), bus.OutboundMessage{
+		Channel: "test",
+		ChatID:  "123",
+		Content: "hello",
+	})
+	if err == nil {
+		t.Fatal("expected send failure to be returned")
+	}
+	if !errors.Is(err, ErrSendFailed) {
+		t.Fatalf("expected ErrSendFailed, got %v", err)
+	}
+}
+
 func TestSendMessage_WithSplitting(t *testing.T) {
 	m := newTestManager()
 
