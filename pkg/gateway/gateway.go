@@ -360,6 +360,7 @@ func setupAndStartServices(
 	}
 
 	agentLoop.SetChannelManager(runningServices.ChannelManager)
+	runningServices.ChannelManager.SetOutboundHistoryRecorder(agentLoop)
 	agentLoop.SetMediaStore(runningServices.MediaStore)
 
 	transcriber := asr.DetectTranscriber(cfg)

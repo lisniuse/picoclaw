@@ -105,6 +105,7 @@ const (
 	handledToolResponseSummary = "Requested output delivered via tool attachment."
 	sessionKeyAgentPrefix      = "agent:"
 	metadataKeyAccountID       = "account_id"
+	metadataKeyPeerKind        = "peer_kind"
 	metadataKeyGuildID         = "guild_id"
 	metadataKeyTeamID          = "team_id"
 	metadataKeyReplyToMessage  = "reply_to_message_id"
@@ -973,6 +974,47 @@ func (al *AgentLoop) RegisterTool(tool tools.Tool) {
 
 func (al *AgentLoop) SetChannelManager(cm *channels.Manager) {
 	al.channelManager = cm
+}
+
+func (al *AgentLoop) RecordOutboundHistory(ctx context.Context, msg bus.OutboundMessage) error {
+	_ = ctx
+
+	channel := strings.TrimSpace(msg.Channel)
+	chatID := strings.TrimSpace(msg.ChatID)
+	content := msg.Content
+	if channel == "" || chatID == "" || content == "" {
+		return nil
+	}
+
+	peerKind := "direct"
+	accountID := ""
+	if msg.Metadata != nil {
+		if kind := strings.TrimSpace(msg.Metadata[metadataKeyPeerKind]); kind != "" {
+			peerKind = kind
+		}
+		accountID = strings.TrimSpace(msg.Metadata[metadataKeyAccountID])
+	}
+
+	registry := al.GetRegistry()
+	route := registry.ResolveRoute(routing.RouteInput{
+		Channel:   channel,
+		AccountID: accountID,
+		Peer: &routing.RoutePeer{
+			Kind: peerKind,
+			ID:   chatID,
+		},
+	})
+
+	agentInstance, ok := registry.GetAgent(route.AgentID)
+	if !ok || agentInstance == nil {
+		return fmt.Errorf("no agent available for route %q", route.AgentID)
+	}
+
+	agentInstance.Sessions.AddMessage(route.SessionKey, "assistant", content)
+	if err := agentInstance.Sessions.Save(route.SessionKey); err != nil {
+		return err
+	}
+	return nil
 }
 
 // ReloadProviderAndConfig atomically swaps the provider and config with proper synchronization.

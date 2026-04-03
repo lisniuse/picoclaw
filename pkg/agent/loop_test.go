@@ -117,6 +117,34 @@ func newTestAgentLoop(
 	return al, cfg, msgBus, provider, func() { os.RemoveAll(tmpDir) }
 }
 
+func TestRecordOutboundHistory_DefaultsToMainDirectSession(t *testing.T) {
+	al, _, _, _, cleanup := newTestAgentLoop(t)
+	defer cleanup()
+
+	err := al.RecordOutboundHistory(context.Background(), bus.OutboundMessage{
+		Channel: "weixin",
+		ChatID:  "user-1",
+		Content: "manual reply",
+	})
+	if err != nil {
+		t.Fatalf("RecordOutboundHistory() error = %v", err)
+	}
+
+	defaultAgent := al.GetRegistry().GetDefaultAgent()
+	if defaultAgent == nil {
+		t.Fatal("expected default agent")
+	}
+
+	sessionKey := routing.BuildAgentMainSessionKey(routing.DefaultAgentID)
+	history := defaultAgent.Sessions.GetHistory(sessionKey)
+	if len(history) != 1 {
+		t.Fatalf("history length = %d, want 1", len(history))
+	}
+	if history[0].Role != "assistant" || history[0].Content != "manual reply" {
+		t.Fatalf("history[0] = %+v", history[0])
+	}
+}
+
 func TestProcessMessage_IncludesCurrentSenderInDynamicContext(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "agent-test-*")
 	if err != nil {

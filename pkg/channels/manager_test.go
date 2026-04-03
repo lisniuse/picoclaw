@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -92,6 +94,19 @@ func (m *mockDeletingMediaChannel) DeleteMessage(
 	m.lastDeleted.chatID = chatID
 	m.lastDeleted.messageID = messageID
 	return nil
+}
+
+type mockOutboundHistoryRecorder struct {
+	recorded []bus.OutboundMessage
+	err      error
+}
+
+func (m *mockOutboundHistoryRecorder) RecordOutboundHistory(
+	_ context.Context,
+	msg bus.OutboundMessage,
+) error {
+	m.recorded = append(m.recorded, msg)
+	return m.err
 }
 
 // newTestManager creates a minimal Manager suitable for unit tests.
@@ -1411,6 +1426,73 @@ func TestSendMessage_PropagatesFailure(t *testing.T) {
 	}
 	if !errors.Is(err, ErrSendFailed) {
 		t.Fatalf("expected ErrSendFailed, got %v", err)
+	}
+}
+
+func TestHandleSend_RecordsHistoryByDefault(t *testing.T) {
+	m := newTestManager()
+	ch := &mockChannel{}
+	w := &channelWorker{
+		ch:      ch,
+		limiter: rate.NewLimiter(rate.Inf, 1),
+	}
+	recorder := &mockOutboundHistoryRecorder{}
+
+	m.channels["test"] = ch
+	m.workers["test"] = w
+	m.SetOutboundHistoryRecorder(recorder)
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/v1/send",
+		strings.NewReader(`{"channel":"test","to":"123","content":"hello"}`),
+	)
+	resp := httptest.NewRecorder()
+
+	m.handleSend(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("handleSend() status = %d, want %d", resp.Code, http.StatusOK)
+	}
+	if len(recorder.recorded) != 1 {
+		t.Fatalf("expected 1 recorded history message, got %d", len(recorder.recorded))
+	}
+	if recorder.recorded[0].Channel != "test" || recorder.recorded[0].ChatID != "123" || recorder.recorded[0].Content != "hello" {
+		t.Fatalf("recorded message = %+v", recorder.recorded[0])
+	}
+}
+
+func TestHandleSend_DoesNotRecordHistoryWhenSendFails(t *testing.T) {
+	m := newTestManager()
+	ch := &mockChannel{
+		sendFn: func(_ context.Context, _ bus.OutboundMessage) error {
+			return fmt.Errorf("cannot send: %w", ErrSendFailed)
+		},
+	}
+	w := &channelWorker{
+		ch:      ch,
+		limiter: rate.NewLimiter(rate.Inf, 1),
+	}
+	recorder := &mockOutboundHistoryRecorder{}
+
+	m.channels["test"] = ch
+	m.workers["test"] = w
+	m.SetOutboundHistoryRecorder(recorder)
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/v1/send",
+		strings.NewReader(`{"channel":"test","to":"123","content":"hello"}`),
+	)
+	resp := httptest.NewRecorder()
+
+	m.handleSend(resp, req)
+
+	if resp.Code != http.StatusInternalServerError {
+		t.Fatalf("handleSend() status = %d, want %d", resp.Code, http.StatusInternalServerError)
+	}
+	if len(recorder.recorded) != 0 {
+		t.Fatalf("expected no history to be recorded, got %d entries", len(recorder.recorded))
 	}
 }
 

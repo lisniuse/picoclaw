@@ -78,21 +78,26 @@ type channelWorker struct {
 	limiter    *rate.Limiter
 }
 
+type OutboundHistoryRecorder interface {
+	RecordOutboundHistory(ctx context.Context, msg bus.OutboundMessage) error
+}
+
 type Manager struct {
-	channels      map[string]Channel
-	workers       map[string]*channelWorker
-	bus           *bus.MessageBus
-	config        *config.Config
-	mediaStore    media.MediaStore
-	dispatchTask  *asyncTask
-	mux           *dynamicServeMux
-	httpServer    *http.Server
-	mu            sync.RWMutex
-	placeholders  sync.Map          // "channel:chatID" → placeholderID (string)
-	typingStops   sync.Map          // "channel:chatID" → func()
-	reactionUndos sync.Map          // "channel:chatID" → reactionEntry
-	streamActive  sync.Map          // "channel:chatID" → true (set when streamer.Finalize sent the message)
-	channelHashes map[string]string // channel name → config hash
+	channels        map[string]Channel
+	historyRecorder OutboundHistoryRecorder
+	workers         map[string]*channelWorker
+	bus             *bus.MessageBus
+	config          *config.Config
+	mediaStore      media.MediaStore
+	dispatchTask    *asyncTask
+	mux             *dynamicServeMux
+	httpServer      *http.Server
+	mu              sync.RWMutex
+	placeholders    sync.Map          // "channel:chatID" → placeholderID (string)
+	typingStops     sync.Map          // "channel:chatID" → func()
+	reactionUndos   sync.Map          // "channel:chatID" → reactionEntry
+	streamActive    sync.Map          // "channel:chatID" → true (set when streamer.Finalize sent the message)
+	channelHashes   map[string]string // channel name → config hash
 }
 
 type asyncTask struct {
@@ -459,6 +464,10 @@ func (m *Manager) SetupHTTPServer(addr string, healthServer *health.Server) {
 	}
 }
 
+func (m *Manager) SetOutboundHistoryRecorder(recorder OutboundHistoryRecorder) {
+	m.historyRecorder = recorder
+}
+
 // handleSend handles POST /v1/send for directly sending a message to a channel.
 func (m *Manager) handleSend(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -467,9 +476,11 @@ func (m *Manager) handleSend(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Channel string `json:"channel"`
-		To      string `json:"to"`
-		Content string `json:"content"`
+		Channel       string            `json:"channel"`
+		To            string            `json:"to"`
+		Content       string            `json:"content"`
+		Metadata      map[string]string `json:"metadata,omitempty"`
+		RecordHistory *bool             `json:"record_history,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
@@ -481,13 +492,25 @@ func (m *Manager) handleSend(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
-	if err := m.SendMessage(ctx, bus.OutboundMessage{
-		Channel: req.Channel,
-		ChatID:  req.To,
-		Content: req.Content,
-	}); err != nil {
+	msg := bus.OutboundMessage{
+		Channel:  req.Channel,
+		ChatID:   req.To,
+		Content:  req.Content,
+		Metadata: req.Metadata,
+	}
+	if err := m.SendMessage(ctx, msg); err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
 		return
+	}
+	recordHistory := req.RecordHistory == nil || *req.RecordHistory
+	if recordHistory && m.historyRecorder != nil {
+		if err := m.historyRecorder.RecordOutboundHistory(ctx, msg); err != nil {
+			logger.WarnCF("channels", "Failed to record outbound message in history", map[string]any{
+				"channel": req.Channel,
+				"chat_id": req.To,
+				"error":   err.Error(),
+			})
+		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprint(w, `{"ok":true}`)

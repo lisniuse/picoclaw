@@ -42,7 +42,9 @@ type FeishuChannel struct {
 	wsClient   *larkws.Client
 	tokenCache *tokenCache // custom cache that supports invalidation
 
-	botOpenID atomic.Value // stores string; populated lazily for @mention detection
+	botOpenID       atomic.Value // stores string; populated lazily for @mention detection
+	directChats     sync.Map
+	directChatsPath string
 
 	mu     sync.Mutex
 	cancel context.CancelFunc
@@ -60,11 +62,13 @@ func NewFeishuChannel(cfg config.FeishuConfig, bus *bus.MessageBus) (*FeishuChan
 		opts = append(opts, lark.WithOpenBaseUrl(lark.LarkBaseUrl))
 	}
 	ch := &FeishuChannel{
-		BaseChannel: base,
-		config:      cfg,
-		tokenCache:  tc,
-		client:      lark.NewClient(cfg.AppID, cfg.AppSecret.String(), opts...),
+		BaseChannel:     base,
+		config:          cfg,
+		tokenCache:      tc,
+		client:          lark.NewClient(cfg.AppID, cfg.AppSecret.String(), opts...),
+		directChatsPath: buildFeishuDirectChatsPath(cfg),
 	}
+	ch.restoreDirectChats()
 	ch.SetOwner(ch)
 	return ch, nil
 }
@@ -458,6 +462,8 @@ func (c *FeishuChannel) handleMessageReceive(ctx context.Context, event *larkim.
 	var peer bus.Peer
 	if chatType == "p2p" {
 		peer = bus.Peer{Kind: "direct", ID: senderID}
+		c.directChats.Store(senderID, chatID)
+		c.persistDirectChats(senderID)
 	} else {
 		peer = bus.Peer{Kind: "group", ID: chatID}
 
@@ -486,6 +492,42 @@ func (c *FeishuChannel) handleMessageReceive(ctx context.Context, event *larkim.
 
 	c.HandleMessage(ctx, peer, messageID, senderID, chatID, content, mediaRefs, metadata, senderInfo)
 	return nil
+}
+
+func (c *FeishuChannel) restoreDirectChats() {
+	state, err := loadDirectChatsState(c.directChatsPath)
+	if err != nil {
+		logger.WarnCF("feishu", "Failed to load persisted direct chats", map[string]any{
+			"path":  c.directChatsPath,
+			"error": err.Error(),
+		})
+		return
+	}
+	for userID, chatID := range state.Chats {
+		if strings.TrimSpace(userID) == "" || strings.TrimSpace(chatID) == "" {
+			continue
+		}
+		c.directChats.Store(userID, chatID)
+	}
+}
+
+func (c *FeishuChannel) persistDirectChats(lastUserID string) {
+	chats := make(map[string]string)
+	c.directChats.Range(func(k, v any) bool {
+		userID, okUser := k.(string)
+		chatID, okChat := v.(string)
+		if okUser && okChat && strings.TrimSpace(userID) != "" && strings.TrimSpace(chatID) != "" {
+			chats[userID] = chatID
+		}
+		return true
+	})
+
+	if err := saveDirectChatsState(c.directChatsPath, chats, lastUserID); err != nil {
+		logger.WarnCF("feishu", "Failed to persist direct chats", map[string]any{
+			"path":  c.directChatsPath,
+			"error": err.Error(),
+		})
+	}
 }
 
 // --- Internal helpers ---

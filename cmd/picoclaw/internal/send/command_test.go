@@ -83,7 +83,7 @@ func TestResolveLastUserID_UsesPersistedLastUserID(t *testing.T) {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
 
-	got, err := resolveLastUserID(home, "weixin")
+	got, err := resolveLastUserID(home, filepath.Join(home, "config.json"), "weixin")
 	if err != nil {
 		t.Fatalf("resolveLastUserID() error = %v", err)
 	}
@@ -105,7 +105,7 @@ func TestResolveLastUserID_SingleTokenFallback(t *testing.T) {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
 
-	got, err := resolveLastUserID(home, "weixin")
+	got, err := resolveLastUserID(home, filepath.Join(home, "config.json"), "weixin")
 	if err != nil {
 		t.Fatalf("resolveLastUserID() error = %v", err)
 	}
@@ -127,12 +127,73 @@ func TestResolveLastUserID_RejectsAmbiguousState(t *testing.T) {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
 
-	_, err := resolveLastUserID(home, "weixin")
+	_, err := resolveLastUserID(home, filepath.Join(home, "config.json"), "weixin")
 	if err == nil {
 		t.Fatal("resolveLastUserID() expected error for ambiguous state")
 	}
 	if !strings.Contains(err.Error(), "multiple user IDs") {
 		t.Fatalf("resolveLastUserID() error = %v, want ambiguity hint", err)
+	}
+}
+
+func TestResolveLastUserID_FallsBackToRecentSession(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	sessionsDir := filepath.Join(workspace, "sessions")
+	if err := os.MkdirAll(sessionsDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+
+	configPath := filepath.Join(home, "config.json")
+	configData := `{"version":2,"agents":{"defaults":{"workspace":"` + strings.ReplaceAll(workspace, `\`, `\\`) + `"}}}`
+	if err := os.WriteFile(configPath, []byte(configData), 0o600); err != nil {
+		t.Fatalf("WriteFile(config) error = %v", err)
+	}
+
+	oldMeta := filepath.Join(sessionsDir, "agent_main_telegram_direct_old.meta.json")
+	oldData := `{"key":"agent:main:telegram:direct:user_old","updated_at":"2026-04-03T11:00:00+08:00"}`
+	if err := os.WriteFile(oldMeta, []byte(oldData), 0o600); err != nil {
+		t.Fatalf("WriteFile(oldMeta) error = %v", err)
+	}
+	oldTime := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(oldMeta, oldTime, oldTime); err != nil {
+		t.Fatalf("Chtimes(oldMeta) error = %v", err)
+	}
+
+	newMeta := filepath.Join(sessionsDir, "agent_main_telegram_direct_new.meta.json")
+	newData := `{"key":"agent:main:telegram:direct:user_latest","updated_at":"2026-04-03T12:00:00+08:00"}`
+	if err := os.WriteFile(newMeta, []byte(newData), 0o600); err != nil {
+		t.Fatalf("WriteFile(newMeta) error = %v", err)
+	}
+
+	got, err := resolveLastUserID(home, configPath, "telegram")
+	if err != nil {
+		t.Fatalf("resolveLastUserID() error = %v", err)
+	}
+	if got != "user_latest" {
+		t.Fatalf("resolveLastUserID() = %q, want user_latest", got)
+	}
+}
+
+func TestResolveLastUserID_PrefersFeishuDirectChatState(t *testing.T) {
+	home := t.TempDir()
+	dir := filepath.Join(home, "channels", "feishu", "direct-chats")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+
+	path := filepath.Join(dir, "cli_app.json")
+	data := `{"chats":{"ou_a":"oc_direct_a","ou_b":"oc_direct_b"},"last_user_id":"ou_b"}`
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	got, err := resolveLastUserID(home, filepath.Join(home, "config.json"), "feishu")
+	if err != nil {
+		t.Fatalf("resolveLastUserID() error = %v", err)
+	}
+	if got != "oc_direct_b" {
+		t.Fatalf("resolveLastUserID() = %q, want oc_direct_b", got)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -22,6 +23,11 @@ import (
 
 type contextTokensState struct {
 	Tokens     map[string]string `json:"tokens"`
+	LastUserID string            `json:"last_user_id,omitempty"`
+}
+
+type directChatsState struct {
+	Chats      map[string]string `json:"chats"`
 	LastUserID string            `json:"last_user_id,omitempty"`
 }
 
@@ -58,7 +64,7 @@ func NewSendCommand() *cobra.Command {
 
 			// Resolve --to from channel state if not provided
 			if to == "" {
-				resolved, err := resolveLastUserID(homePath, channel)
+				resolved, err := resolveLastUserID(homePath, internal.GetConfigPath(), channel)
 				if err != nil || resolved == "" {
 					return fmt.Errorf("--to not specified and could not find last user ID for channel %q: %v", channel, err)
 				}
@@ -136,11 +142,87 @@ func resolveMessageContent(message, messageFile string) (string, error) {
 
 // resolveLastUserID reads the channel's context-tokens state directory and
 // returns the most recently active user ID when the channel persists it.
-func resolveLastUserID(homePath, channel string) (string, error) {
+func resolveLastUserID(homePath, configPath, channel string) (string, error) {
+	if strings.EqualFold(channel, "feishu") {
+		if resolved, err := resolveLastFeishuChatID(homePath); err == nil && resolved != "" {
+			return resolved, nil
+		}
+	}
+
+	if resolved, handled, err := resolveLastUserIDFromContextState(homePath, channel); handled {
+		return resolved, err
+	}
+	return resolveLastUserIDFromSessions(configPath, channel)
+}
+
+func resolveLastFeishuChatID(homePath string) (string, error) {
+	dir := filepath.Join(homePath, "channels", "feishu", "direct-chats")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("reading direct chat state dir %s: %w", dir, err)
+		}
+		return "", fmt.Errorf("reading direct chat state dir %s: %w", dir, err)
+	}
+
+	var latestFile string
+	var latestTime time.Time
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().After(latestTime) {
+			latestTime = info.ModTime()
+			latestFile = filepath.Join(dir, e.Name())
+		}
+	}
+
+	if latestFile == "" {
+		return "", fmt.Errorf("no direct chat state files found in %s", dir)
+	}
+
+	data, err := os.ReadFile(latestFile)
+	if err != nil {
+		return "", err
+	}
+
+	var state directChatsState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return "", fmt.Errorf("parsing direct chat state file: %w", err)
+	}
+
+	if state.LastUserID != "" {
+		if chatID := strings.TrimSpace(state.Chats[state.LastUserID]); chatID != "" {
+			return chatID, nil
+		}
+	}
+
+	switch len(state.Chats) {
+	case 0:
+		return "", fmt.Errorf("no direct chat IDs found in state file")
+	case 1:
+		for _, chatID := range state.Chats {
+			if strings.TrimSpace(chatID) != "" {
+				return chatID, nil
+			}
+		}
+	}
+
+	return "", errors.New("direct chat state contains multiple users but no persisted last_user_id; specify --to explicitly")
+}
+
+func resolveLastUserIDFromContextState(homePath, channel string) (string, bool, error) {
 	dir := filepath.Join(homePath, "channels", channel, "context-tokens")
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return "", fmt.Errorf("reading state dir %s: %w", dir, err)
+		if os.IsNotExist(err) {
+			return "", false, nil
+		}
+		return "", true, fmt.Errorf("reading state dir %s: %w", dir, err)
 	}
 
 	// Find the most recently modified file
@@ -161,35 +243,110 @@ func resolveLastUserID(homePath, channel string) (string, error) {
 	}
 
 	if latestFile == "" {
-		return "", fmt.Errorf("no state files found in %s", dir)
+		return "", false, nil
 	}
 
 	data, err := os.ReadFile(latestFile)
 	if err != nil {
-		return "", err
+		return "", true, err
 	}
 
 	var state contextTokensState
 	if err := json.Unmarshal(data, &state); err != nil {
-		return "", fmt.Errorf("parsing state file: %w", err)
+		return "", true, fmt.Errorf("parsing state file: %w", err)
 	}
 
 	if state.LastUserID != "" {
 		if len(state.Tokens) == 0 || state.Tokens[state.LastUserID] != "" {
-			return state.LastUserID, nil
+			return state.LastUserID, true, nil
 		}
 	}
 
 	switch len(state.Tokens) {
 	case 0:
-		return "", fmt.Errorf("no user IDs found in state file")
+		return "", false, nil
 	case 1:
 		for userID := range state.Tokens {
-			return userID, nil
+			return userID, true, nil
 		}
 	}
 
-	return "", errors.New("state file contains multiple user IDs but no persisted last_user_id; specify --to explicitly")
+	return "", true, errors.New("state file contains multiple user IDs but no persisted last_user_id; specify --to explicitly")
+}
+
+func resolveLastUserIDFromSessions(configPath, channel string) (string, error) {
+	cfg, err := config.LoadConfig(configPath)
+	if err != nil {
+		return "", fmt.Errorf("loading config for session fallback: %w", err)
+	}
+
+	sessionsDir := filepath.Join(cfg.WorkspacePath(), "sessions")
+	entries, err := os.ReadDir(sessionsDir)
+	if err != nil {
+		return "", fmt.Errorf("reading sessions dir %s: %w", sessionsDir, err)
+	}
+
+	var latestPath string
+	var latestTime time.Time
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".meta.json") {
+			continue
+		}
+		path := filepath.Join(sessionsDir, entry.Name())
+		peerID, ok, err := sessionPeerIDForChannel(path, channel)
+		if err != nil || !ok || peerID == "" {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().After(latestTime) {
+			latestTime = info.ModTime()
+			latestPath = path
+		}
+	}
+
+	if latestPath == "" {
+		return "", fmt.Errorf("no recent direct session found for channel %q in %s", channel, sessionsDir)
+	}
+
+	peerID, ok, err := sessionPeerIDForChannel(latestPath, channel)
+	if err != nil {
+		return "", err
+	}
+	if !ok || peerID == "" {
+		return "", fmt.Errorf("latest session %s does not contain a direct peer for channel %q", latestPath, channel)
+	}
+	return peerID, nil
+}
+
+func sessionPeerIDForChannel(metaPath, channel string) (string, bool, error) {
+	data, err := os.ReadFile(metaPath)
+	if err != nil {
+		return "", false, err
+	}
+
+	var meta struct {
+		Key string `json:"key"`
+	}
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return "", false, fmt.Errorf("parsing session meta %s: %w", metaPath, err)
+	}
+
+	parts := strings.Split(meta.Key, ":")
+	if len(parts) < 4 || parts[0] != "agent" {
+		return "", false, nil
+	}
+
+	if len(parts) >= 5 && strings.EqualFold(parts[2], channel) && parts[3] == "direct" {
+		return strings.Join(parts[4:], ":"), true, nil
+	}
+	if len(parts) >= 6 && strings.EqualFold(parts[2], channel) && parts[4] == "direct" {
+		return strings.Join(parts[5:], ":"), true, nil
+	}
+
+	return "", false, nil
 }
 
 func resolveGatewaySendURL(homePath, configPath string, probeClient *http.Client) (string, error) {
