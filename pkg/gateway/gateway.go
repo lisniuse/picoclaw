@@ -417,7 +417,7 @@ func setupAndStartServices(
 	runningServices.authToken = authToken
 	runningServices.HealthServer = health.NewServer(listenResult.ProbeHost, cfg.Gateway.Port, authToken)
 
-	listenAddr := ""
+	var listenAddr string
 	if len(listenResult.Listeners) > 0 {
 		listenAddr = listenResult.Listeners[0].Addr().String()
 	} else {

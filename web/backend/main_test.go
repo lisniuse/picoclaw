@@ -51,9 +51,21 @@ func TestDashboardTokenConfigHelpPath(t *testing.T) {
 		source launcherconfig.DashboardTokenSource
 		want   string
 	}{
-		{name: "env token does not expose config path", source: launcherconfig.DashboardTokenSourceEnv, want: ""},
-		{name: "config token exposes config path", source: launcherconfig.DashboardTokenSourceConfig, want: launcherPath},
-		{name: "random token does not expose config path", source: launcherconfig.DashboardTokenSourceRandom, want: ""},
+		{
+			name:   "env token does not expose config path",
+			source: launcherconfig.DashboardTokenSourceEnv,
+			want:   "",
+		},
+		{
+			name:   "config token exposes config path",
+			source: launcherconfig.DashboardTokenSourceConfig,
+			want:   launcherPath,
+		},
+		{
+			name:   "random token does not expose config path",
+			source: launcherconfig.DashboardTokenSourceRandom,
+			want:   "",
+		},
 	}
 
 	for _, tt := range tests {
@@ -98,7 +110,14 @@ func TestResolveLauncherHostInput(t *testing.T) {
 		wantActive   bool
 		wantErr      bool
 	}{
-		{name: "flag host wins", flagHost: "127.0.0.1", explicitFlag: true, envHost: "::", wantHost: "127.0.0.1", wantActive: true},
+		{
+			name:         "flag host wins",
+			flagHost:     "127.0.0.1",
+			explicitFlag: true,
+			envHost:      "::",
+			wantHost:     "127.0.0.1",
+			wantActive:   true,
+		},
 		{name: "env host used when flag absent", envHost: "127.0.0.1,::1", wantHost: "127.0.0.1,::1", wantActive: true},
 		{name: "blank env ignored", envHost: "   ", wantHost: "", wantActive: false},
 		{name: "invalid flag rejected", flagHost: "127.0.0.1, ", explicitFlag: true, wantErr: true},
@@ -230,10 +249,34 @@ func TestWildcardAdvertiseIP(t *testing.T) {
 		ipv6      string
 		want      string
 	}{
-		{name: "ipv4 wildcard prefers ipv6 when available", bindHosts: []string{"0.0.0.0"}, ipv4: "192.168.1.2", ipv6: "2001:db8::1", want: "2001:db8::1"},
-		{name: "ipv6 wildcard uses ipv6", bindHosts: []string{"::"}, ipv4: "192.168.1.2", ipv6: "2001:db8::1", want: "2001:db8::1"},
-		{name: "ipv6 wildcard falls back to ipv4", bindHosts: []string{"::"}, ipv4: "192.168.1.2", ipv6: "", want: "192.168.1.2"},
-		{name: "non wildcard does not advertise", bindHosts: []string{"127.0.0.1"}, ipv4: "192.168.1.2", ipv6: "2001:db8::1", want: ""},
+		{
+			name:      "ipv4 wildcard prefers ipv6 when available",
+			bindHosts: []string{"0.0.0.0"},
+			ipv4:      "192.168.1.2",
+			ipv6:      "2001:db8::1",
+			want:      "2001:db8::1",
+		},
+		{
+			name:      "ipv6 wildcard uses ipv6",
+			bindHosts: []string{"::"},
+			ipv4:      "192.168.1.2",
+			ipv6:      "2001:db8::1",
+			want:      "2001:db8::1",
+		},
+		{
+			name:      "ipv6 wildcard falls back to ipv4",
+			bindHosts: []string{"::"},
+			ipv4:      "192.168.1.2",
+			ipv6:      "",
+			want:      "192.168.1.2",
+		},
+		{
+			name:      "non wildcard does not advertise",
+			bindHosts: []string{"127.0.0.1"},
+			ipv4:      "192.168.1.2",
+			ipv6:      "2001:db8::1",
+			want:      "",
+		},
 	}
 
 	for _, tt := range tests {

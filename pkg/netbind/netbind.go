@@ -506,8 +506,14 @@ func openGroup(group bindGroup, port string) ([]net.Listener, []string, string, 
 
 func openAdaptiveLoopbackGroup(allowIPv6, allowIPv4 bool, port string) ([]net.Listener, []string, string, error) {
 	if allowIPv6 && allowIPv4 {
-		if ln6, actualPort, err6 := openExactListener(exactBinding{host: "::1", network: "tcp6", v6Only: true}, port); err6 == nil {
-			if ln4, _, err4 := openExactListener(exactBinding{host: "127.0.0.1", network: "tcp4"}, actualPort); err4 == nil {
+		if ln6, actualPort, err6 := openExactListener(
+			exactBinding{host: "::1", network: "tcp6", v6Only: true},
+			port,
+		); err6 == nil {
+			if ln4, _, err4 := openExactListener(
+				exactBinding{host: "127.0.0.1", network: "tcp4"},
+				actualPort,
+			); err4 == nil {
 				return []net.Listener{ln6, ln4}, []string{"::1", "127.0.0.1"}, actualPort, nil
 			}
 			_ = ln6.Close()

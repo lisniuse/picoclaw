@@ -216,7 +216,8 @@ func startGatewayAndCaptureEnv(t *testing.T, h *Handler) gatewayStartEnvSnapshot
 		raw, err := os.ReadFile(envPath)
 		if err == nil {
 			var snapshot gatewayStartEnvSnapshot
-			if err := json.Unmarshal(raw, &snapshot); err != nil {
+			err = json.Unmarshal(raw, &snapshot)
+			if err != nil {
 				t.Fatalf("Unmarshal(child env) error = %v", err)
 			}
 			return snapshot
